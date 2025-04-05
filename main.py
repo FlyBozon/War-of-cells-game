@@ -16,7 +16,7 @@ logging.basicConfig(
     format='%(asctime)s - %(levelname)s - %(message)s',
     datefmt='%H:%M:%S'
 )
-logger = logging.getLogger('CellConquestGame')
+logger = logging.getLogger('WarOfCEllsGame')
 
 # Constants
 SCREEN_WIDTH = 800
@@ -612,7 +612,7 @@ class Bridge:
 class Game:
     def __init__(self):
         self.screen = pygame.display.set_mode((SCREEN_WIDTH, SCREEN_HEIGHT))
-        pygame.display.set_caption("Cell Conquest Game")
+        pygame.display.set_caption("War of Cells Game")
         self.clock = pygame.time.Clock()
         self.font = pygame.font.SysFont('Arial', 14)
 
@@ -630,14 +630,49 @@ class Game:
         self.context_menu_options = ["Remove All Bridges"]
 
         # Add level-related attributes
+        self.running = True
+        self.game_started = False
+        self.game_over_state = False
+
+        # Level tracking
         self.current_level = "level1"
-        self.game_data = None
+        self.points = 0
+        self.time_taken = 0
+        self.start_time = 0
+
+        # Load game data
+        self.game_data = load_game_data("game_data.json")
+
+        # Initialize the menu
+        self.show_menu()
 
         # Load the first level
-        load_level(self, self.current_level)
+        #load_level(self, self.current_level)
 
         # Initialize the game board
-        self.initialize_board()
+        #self.initialize_board()
+
+    def show_menu(self):
+        """Show the level selection menu"""
+        # If the menu returns True, a level was selected
+        if create_menu(self):
+            self.start_game()
+        else:
+            self.running = False
+
+    def start_game(self):
+        """Start the game with the current level"""
+        # Load the selected level
+        load_level(self, self.current_level)
+
+        # Reset game state
+        self.game_started = True
+        self.game_over_state = False
+        self.points = 0
+        self.time_taken = 0
+        self.start_time = pygame.time.get_ticks() / 1000  # Start time in seconds
+
+        logger.info(f"Starting game with level: {self.current_level}")
 
     def initialize_board(self):
         # Create initial cells
@@ -650,12 +685,14 @@ class Game:
         self.cells.append(enemy_cell)
 
         # Add some empty cells
+        """
         for _ in range(8):
             x = random.randint(100, SCREEN_WIDTH - 100)
             y = random.randint(100, SCREEN_HEIGHT - 100)
             shape = random.choice(list(CellShape))
             empty_cell = Cell(x, y, CellType.EMPTY, shape)
             self.cells.append(empty_cell)
+        """
 
     def create_collision_effect(self, x, y):
         """Create a visual effect for ball collisions"""
@@ -910,6 +947,15 @@ class Game:
         background = self.draw_background_gradient()
 
         while running:
+            if not self.game_started:
+                self.show_menu()
+                continue
+
+            # Update time if game is in progress
+            if not self.game_over_state:
+                current_time_sec = pygame.time.get_ticks() / 1000
+                self.time_taken = current_time_sec - self.start_time
+
             current_time = pygame.time.get_ticks()
 
             # Event handling
@@ -1077,21 +1123,36 @@ class Game:
                     # Handle ball effect on target cell
                     if target_cell.cell_type == CellType.EMPTY:
                         # Try to capture empty cell with multiplied attack
-                        target_cell.try_capture(ball.attack_value, ball.is_player)
+                        captured = target_cell.try_capture(ball.attack_value, ball.is_player)
+                        if captured and ball.is_player:
+                            self.points += 50  # Award points for capturing empty cell
                     elif (target_cell.cell_type == CellType.PLAYER and ball.is_player) or \
                             (target_cell.cell_type == CellType.ENEMY and not ball.is_player):
                         # Add points to allied cell
                         target_cell.points += ball.attack_value
+                        if ball.is_player:
+                            self.points += 5  # Small points for strengthening own cell
                     else:
                         # Remove points from enemy cell with multiplied attack
+                        old_points = target_cell.points
                         target_cell.points = max(0, target_cell.points - ball.attack_value)
+                        points_reduced = old_points - target_cell.points
 
-                        # NEW CODE: Check if cell has 0 points and convert it
+                        # Award points to the player for reducing enemy points
+                        if ball.is_player:
+                            self.points += points_reduced * 10
+
+                        # Check if cell has 0 points and convert it
                         if target_cell.points == 0:
+                            self.remove_all_bridges_from_cell(target_cell)
                             # Convert cell to attacker's color
                             old_type = target_cell.cell_type
                             target_cell.cell_type = CellType.PLAYER if ball.is_player else CellType.ENEMY
                             target_cell.points = 10  # Give some starting points
+
+                            # Award bonus points for capturing cell
+                            if ball.is_player:
+                                self.points += 100  # Big bonus for capturing enemy cell
 
                             # Log the capture
                             logger.info(
@@ -1322,6 +1383,18 @@ class Game:
         enemy_cells = sum(1 for cell in self.cells if cell.cell_type == CellType.ENEMY)
         empty_cells = sum(1 for cell in self.cells if cell.cell_type == CellType.EMPTY)
 
+        # Check for win
+        if empty_cells == 0:
+            if enemy_cells == 0:
+                # Player has all cells
+                self.game_over_state = True
+                save_level_stats(self)
+                self.game_over("Player Wins!")
+            elif player_cells == 0:
+                # Enemy has all cells
+                self.game_over_state = True
+                self.game_over("Enemy Wins!")
+
         # Count total points for each side
         player_points = sum(cell.points for cell in self.cells if cell.cell_type == CellType.PLAYER)
         enemy_points = sum(cell.points for cell in self.cells if cell.cell_type == CellType.ENEMY)
@@ -1333,7 +1406,7 @@ class Game:
 
         # Draw info text with colored highlighting
         title_font = pygame.font.SysFont('Arial', 16, bold=True)
-        title_text = "CELL CONQUEST"
+        title_text = "WAR OF CELLS"
         title_surface = title_font.render(title_text, True, (200, 200, 255))
         self.screen.blit(title_surface, (20, 15))
 
@@ -1352,6 +1425,20 @@ class Game:
         controls_surface = self.font.render(controls_text, True, (200, 200, 200))
         self.screen.blit(controls_surface, (20, 75))
 
+        # Draw points and time
+        points_text = f"Points: {self.points}"
+        points_surface = self.font.render(points_text, True, WHITE)
+        self.screen.blit(points_surface, (20, SCREEN_HEIGHT - 60))
+
+        time_text = f"Time: {format_time(self.time_taken)}"
+        time_surface = self.font.render(time_text, True, WHITE)
+        self.screen.blit(time_surface, (20, SCREEN_HEIGHT - 40))
+
+        # Draw level name
+        level_text = f"Level: {self.current_level.replace('level', '')}"
+        level_surface = self.font.render(level_text, True, WHITE)
+        self.screen.blit(level_surface, (20, SCREEN_HEIGHT - 80))
+
     def check_win_condition(self):
         """Check if all cells are occupied by one player"""
         player_cells = sum(1 for cell in self.cells if cell.cell_type == CellType.PLAYER)
@@ -1361,10 +1448,10 @@ class Game:
         # If no empty cells and one side has all cells
         if empty_cells == 0:
             if player_cells == 0:
-                self.game_over("Enemy wins! All cells are captured.")
+                #self.game_over("Enemy wins! All cells are captured.")
                 return True
             elif enemy_cells == 0:
-                self.game_over("Player wins! All cells are captured.")
+                #self.game_over("Player wins! All cells are captured.")
                 return True
 
         return False
@@ -1373,7 +1460,7 @@ class Game:
         """Handle game over state"""
         logger.info(f"Game over: {message}")
 
-        # Create a semi-transparent overlay for the game over message
+        # Create a semi-transparent overlay
         overlay = pygame.Surface((SCREEN_WIDTH, SCREEN_HEIGHT), pygame.SRCALPHA)
         overlay.fill((0, 0, 0, 150))  # Semi-transparent black
         self.screen.blit(overlay, (0, 0))
@@ -1381,35 +1468,80 @@ class Game:
         # Render game over message
         font = pygame.font.SysFont('Arial', 48, bold=True)
         text_surface = font.render(message, True, WHITE)
-        text_rect = text_surface.get_rect(center=(SCREEN_WIDTH / 2, SCREEN_HEIGHT / 2 - 50))
+        text_rect = text_surface.get_rect(center=(SCREEN_WIDTH / 2, SCREEN_HEIGHT / 2 - 60))
         self.screen.blit(text_surface, text_rect)
 
-        # Check if this is a level win
-        if "Player wins" in message:
-            # Render level complete message
-            level_font = pygame.font.SysFont('Arial', 36, bold=True)
-            level_text = f"Level {self.current_level} Complete!"
-            level_surface = level_font.render(level_text, True, (255, 255, 100))
-            level_rect = level_surface.get_rect(center=(SCREEN_WIDTH / 2, SCREEN_HEIGHT / 2))
-            self.screen.blit(level_surface, level_rect)
+        # If player won, show stats
+        if "Player Wins" in message:
+            # Calculate stars
+            stars = calculate_stars(self.points, self.time_taken)
 
-            # Display additional options
-            font_small = pygame.font.SysFont('Arial', 24)
-            next_text = "Press N for next level, R to replay level, or ESC to quit"
-            next_surface = font_small.render(next_text, True, WHITE)
-            next_rect = next_surface.get_rect(center=(SCREEN_WIDTH / 2, SCREEN_HEIGHT / 2 + 50))
-            self.screen.blit(next_surface, next_rect)
-        else:
-            # Render restart instructions
-            font_small = pygame.font.SysFont('Arial', 24)
-            restart_text = "Press R to restart or ESC to quit"
-            restart_surface = font_small.render(restart_text, True, WHITE)
-            restart_rect = restart_surface.get_rect(center=(SCREEN_WIDTH / 2, SCREEN_HEIGHT / 2 + 50))
-            self.screen.blit(restart_surface, restart_rect)
+            # Show stats
+            stats_font = pygame.font.SysFont('Arial', 24)
+
+            # Show points
+            points_text = f"Points: {self.points}"
+            points_surface = stats_font.render(points_text, True, WHITE)
+            points_rect = points_surface.get_rect(center=(SCREEN_WIDTH / 2, SCREEN_HEIGHT / 2 - 10))
+            self.screen.blit(points_surface, points_rect)
+
+            # Show time
+            time_text = f"Time: {format_time(self.time_taken)}"
+            time_surface = stats_font.render(time_text, True, WHITE)
+            time_rect = time_surface.get_rect(center=(SCREEN_WIDTH / 2, SCREEN_HEIGHT / 2 + 20))
+            self.screen.blit(time_surface, time_rect)
+
+            # Draw stars
+            star_font = pygame.font.SysFont('Arial', 20)
+            star_text = f"Stars: "
+            star_surface = star_font.render(star_text, True, WHITE)
+            star_rect = star_surface.get_rect(midright=(SCREEN_WIDTH / 2 - 30, SCREEN_HEIGHT / 2 + 50))
+            self.screen.blit(star_surface, star_rect)
+
+            # Draw star icons
+            for i in range(3):
+                star_color = (255, 255, 0) if i < stars else (80, 80, 80)
+                star_rect = pygame.Rect(SCREEN_WIDTH / 2 - 20 + i * 30, SCREEN_HEIGHT / 2 + 40, 20, 20)
+                points = []
+                for j in range(5):
+                    angle = math.pi * 2 * j / 5 - math.pi / 2
+                    points.append((star_rect.centerx + math.cos(angle) * 10,
+                                   star_rect.centery + math.sin(angle) * 10))
+                    angle += math.pi / 5
+                    points.append((star_rect.centerx + math.cos(angle) * 5,
+                                   star_rect.centery + math.sin(angle) * 5))
+                pygame.draw.polygon(self.screen, star_color, points)
+
+            # Show options
+            options_font = pygame.font.SysFont('Arial', 24)
+
+            # Next level option
+            if self.current_level.startswith("level"):
+                level_num = int(self.current_level[5:])
+                next_level = f"level{level_num + 1}"
+
+                if next_level in self.game_data.get("levels", {}):
+                    next_text = "Press N for next level"
+                    next_surface = options_font.render(next_text, True, (100, 255, 100))
+                    next_rect = next_surface.get_rect(center=(SCREEN_WIDTH / 2, SCREEN_HEIGHT / 2 + 90))
+                    self.screen.blit(next_surface, next_rect)
+
+        # General options
+        options_font = pygame.font.SysFont('Arial', 24)
+
+        menu_text = "Press M to return to menu"
+        menu_surface = options_font.render(menu_text, True, (255, 200, 100))
+        menu_rect = menu_surface.get_rect(center=(SCREEN_WIDTH / 2, SCREEN_HEIGHT / 2 + 120))
+        self.screen.blit(menu_surface, menu_rect)
+
+        quit_text = "Press ESC to quit game"
+        quit_surface = options_font.render(quit_text, True, (255, 100, 100))
+        quit_rect = quit_surface.get_rect(center=(SCREEN_WIDTH / 2, SCREEN_HEIGHT / 2 + 150))
+        self.screen.blit(quit_surface, quit_rect)
 
         pygame.display.flip()
 
-        # Wait for player to restart or quit
+        # Wait for player input
         waiting = True
         while waiting:
             for event in pygame.event.get():
@@ -1420,22 +1552,20 @@ class Game:
                     if event.key == pygame.K_ESCAPE:
                         pygame.quit()
                         sys.exit()
-                    elif event.key == pygame.K_r:
-                        # Reset current level
-                        load_level(self, self.current_level)
+                    elif event.key == pygame.K_m:
+                        # Return to menu
+                        self.game_started = False
                         waiting = False
-                    elif event.key == pygame.K_n and "Player wins" in message:
-                        # Load next level
-                        if self.next_level():
-                            waiting = False
-                        else:
-                            # If no more levels, display game complete
-                            level_surface = level_font.render("Game Complete! All levels finished!", True,
-                                                              (255, 255, 100))
-                            level_rect = level_surface.get_rect(center=(SCREEN_WIDTH / 2, SCREEN_HEIGHT / 2))
-                            self.screen.blit(level_surface, level_rect)
-                            pygame.display.flip()
+                    elif event.key == pygame.K_n and "Player Wins" in message:
+                        # Try to load next level
+                        if self.current_level.startswith("level"):
+                            level_num = int(self.current_level[5:])
+                            next_level = f"level{level_num + 1}"
 
+                            if next_level in self.game_data.get("levels", {}):
+                                self.current_level = next_level
+                                self.start_game()
+                                waiting = False
     def reset_game(self):
         """Reset the game to initial state"""
         self.cells = []
@@ -1463,6 +1593,241 @@ def load_game_data(file_path):
         logger.error(f"Invalid JSON format in game data file: {file_path}")
         return {}
 
+
+def create_menu(game):
+    """Create and show the level selection menu"""
+    # Constants for menu
+    MENU_BG_COLOR = (20, 20, 40)
+    TITLE_COLOR = (220, 220, 255)
+    LEVEL_WIDTH = 150
+    LEVEL_HEIGHT = 180
+    STAR_SIZE = 25
+    LEVELS_PER_ROW = 4
+    SPACING = 30
+
+    # Initialize menu
+    menu_running = True
+    clock = pygame.time.Clock()
+
+    # Load star image
+    star_img = pygame.Surface((STAR_SIZE, STAR_SIZE), pygame.SRCALPHA)
+    # Draw a star shape
+    star_points = []
+    for i in range(5):
+        angle = math.pi * 2 * i / 5 - math.pi / 2
+        star_points.append((STAR_SIZE / 2 + math.cos(angle) * STAR_SIZE / 2,
+                            STAR_SIZE / 2 + math.sin(angle) * STAR_SIZE / 2))
+        angle += math.pi / 5
+        star_points.append((STAR_SIZE / 2 + math.cos(angle) * STAR_SIZE / 4,
+                            STAR_SIZE / 2 + math.sin(angle) * STAR_SIZE / 4))
+    pygame.draw.polygon(star_img, (255, 255, 0), star_points)
+
+    # Load lock image
+    lock_img = pygame.Surface((50, 50), pygame.SRCALPHA)
+    pygame.draw.rect(lock_img, (150, 150, 150), (15, 20, 20, 20))
+    pygame.draw.rect(lock_img, (150, 150, 150), (10, 10, 30, 15))
+    pygame.draw.circle(lock_img, (100, 100, 100), (25, 20), 8)
+
+    while menu_running:
+        # Handle events
+        for event in pygame.event.get():
+            if event.type == pygame.QUIT:
+                pygame.quit()
+                sys.exit()
+            elif event.type == pygame.KEYDOWN:
+                if event.key == pygame.K_ESCAPE:
+                    return False  # Exit game
+            elif event.type == pygame.MOUSEBUTTONDOWN:
+                if event.button == 1:  # Left click
+                    mouse_pos = pygame.mouse.get_pos()
+                    # Check if clicked on a level
+                    level_clicked = check_level_click(mouse_pos, game.game_data)
+                    if level_clicked:
+                        # Check if level is unlocked
+                        if is_level_unlocked(game.game_data, level_clicked):
+                            game.current_level = level_clicked
+                            return True  # Start game with selected level
+
+        # Draw menu
+        game.screen.fill(MENU_BG_COLOR)
+
+        # Draw title
+        title_font = pygame.font.SysFont('Arial', 48, bold=True)
+        title_text = "WAR OF CELLS"
+        title_surface = title_font.render(title_text, True, TITLE_COLOR)
+        title_rect = title_surface.get_rect(center=(SCREEN_WIDTH / 2, 50))
+        game.screen.blit(title_surface, title_rect)
+
+        # Draw levels
+        level_count = len(game.game_data.get("levels", {}))
+        start_x = (SCREEN_WIDTH - (LEVELS_PER_ROW * LEVEL_WIDTH + (LEVELS_PER_ROW - 1) * SPACING)) / 2
+        start_y = 120
+
+        font = pygame.font.SysFont('Arial', 22, bold=True)
+        small_font = pygame.font.SysFont('Arial', 14)
+
+        for i, level_name in enumerate(sorted(game.game_data.get("levels", {}).keys())):
+            row = i // LEVELS_PER_ROW
+            col = i % LEVELS_PER_ROW
+
+            x = start_x + col * (LEVEL_WIDTH + SPACING)
+            y = start_y + row * (LEVEL_HEIGHT + SPACING)
+
+            # Get level info
+            level_info = game.game_data.get("summary", {}).get("levels", {}).get(level_name, {})
+            unlocked = is_level_unlocked(game.game_data, level_name)
+
+            # Draw level box
+            level_color = (60, 80, 120) if unlocked else (60, 60, 60)
+            pygame.draw.rect(game.screen, level_color, (x, y, LEVEL_WIDTH, LEVEL_HEIGHT))
+            pygame.draw.rect(game.screen, (200, 200, 255), (x, y, LEVEL_WIDTH, LEVEL_HEIGHT), 2)
+
+            # Draw level name
+            level_text = f"Level {level_name.replace('level', '')}"
+            level_surface = font.render(level_text, True, (255, 255, 255))
+            level_rect = level_surface.get_rect(center=(x + LEVEL_WIDTH / 2, y + 25))
+            game.screen.blit(level_surface, level_rect)
+
+            if unlocked:
+                # Draw stars
+                stars = level_info.get("stars", 0)
+                star_y = y + 55
+                for s in range(3):
+                    star_color = (255, 255, 0) if s < stars else (70, 70, 70)
+                    star_x = x + LEVEL_WIDTH / 2 - (STAR_SIZE * 3) / 2 + s * STAR_SIZE
+                    pygame.draw.polygon(game.screen, star_color,
+                                        [(p[0] + star_x, p[1] + star_y) for p in star_points])
+
+                # Draw time
+                if "time" in level_info:
+                    time_text = f"Time: {level_info['time']}"
+                    time_surface = small_font.render(time_text, True, (200, 200, 200))
+                    time_rect = time_surface.get_rect(center=(x + LEVEL_WIDTH / 2, y + 90))
+                    game.screen.blit(time_surface, time_rect)
+
+                # Draw score
+                if "score" in level_info:
+                    score_text = f"Score: {level_info['score']}"
+                    score_surface = small_font.render(score_text, True, (200, 200, 200))
+                    score_rect = score_surface.get_rect(center=(x + LEVEL_WIDTH / 2, y + 110))
+                    game.screen.blit(score_surface, score_rect)
+            else:
+                # Draw lock
+                game.screen.blit(lock_img, (x + LEVEL_WIDTH / 2 - 25, y + 60))
+
+        # Draw instructions
+        inst_font = pygame.font.SysFont('Arial', 18)
+        inst_text = "Click on a level to play. Press ESC to exit."
+        inst_surface = inst_font.render(inst_text, True, (180, 180, 180))
+        inst_rect = inst_surface.get_rect(center=(SCREEN_WIDTH / 2, SCREEN_HEIGHT - 40))
+        game.screen.blit(inst_surface, inst_rect)
+
+        pygame.display.flip()
+        clock.tick(30)
+
+    return False
+
+
+def check_level_click(mouse_pos, game_data):
+    """Check if mouse clicked on a level and return level name"""
+    LEVEL_WIDTH = 150
+    LEVEL_HEIGHT = 180
+    LEVELS_PER_ROW = 4
+    SPACING = 30
+
+    level_count = len(game_data.get("levels", {}))
+    start_x = (SCREEN_WIDTH - (LEVELS_PER_ROW * LEVEL_WIDTH + (LEVELS_PER_ROW - 1) * SPACING)) / 2
+    start_y = 120
+
+    for i, level_name in enumerate(sorted(game_data.get("levels", {}).keys())):
+        row = i // LEVELS_PER_ROW
+        col = i % LEVELS_PER_ROW
+
+        x = start_x + col * (LEVEL_WIDTH + SPACING)
+        y = start_y + row * (LEVEL_HEIGHT + SPACING)
+
+        # Check if mouse pos is inside this level box
+        if (x <= mouse_pos[0] <= x + LEVEL_WIDTH and
+                y <= mouse_pos[1] <= y + LEVEL_HEIGHT):
+            return level_name
+
+    return None
+
+
+def is_level_unlocked(game_data, level_name):
+    """Check if the level is unlocked based on previous level completion"""
+    if level_name == "level1":
+        return True  # First level is always unlocked
+
+    # Get level number
+    if level_name.startswith("level"):
+        level_num = int(level_name[5:])
+        prev_level_name = f"level{level_num - 1}"
+
+        # Check if previous level exists and has stars (completed)
+        prev_level_stars = game_data.get("summary", {}).get("levels", {}).get(prev_level_name, {}).get("stars", 0)
+        return prev_level_stars > 0
+
+    return False
+
+
+def calculate_stars(points, time_taken):
+    """Calculate stars based on points and time taken"""
+    # Base calculation on points
+    if points >= 1500:
+        stars = 3
+    elif points >= 1000:
+        stars = 2
+    elif points > 0:
+        stars = 1
+    else:
+        stars = 0
+
+    # Reduce stars if took too long
+    minutes = time_taken / 60  # time_taken is in seconds
+    if minutes > 5:
+        stars = max(0, stars - 1)
+
+    return stars
+
+
+def format_time(seconds):
+    """Format seconds into MM:SS"""
+    minutes = int(seconds // 60)
+    secs = int(seconds % 60)
+    return f"{minutes:02d}:{secs:02d}"
+
+
+def save_level_stats(game):
+    """Save level statistics to the game data"""
+    if not game.game_data:
+        return
+
+    # Ensure summary structure exists
+    if "summary" not in game.game_data:
+        game.game_data["summary"] = {"total_levels": len(game.game_data.get("levels", {})), "levels": {}}
+
+    if "levels" not in game.game_data["summary"]:
+        game.game_data["summary"]["levels"] = {}
+
+    # Calculate stars based on points and time
+    stars = calculate_stars(game.points, game.time_taken)
+
+    # Save level stats
+    game.game_data["summary"]["levels"][game.current_level] = {
+        "stars": stars,
+        "time": format_time(game.time_taken),
+        "score": game.points
+    }
+
+    # Save to file
+    try:
+        with open("game_data.json", "w") as file:
+            json.dump(game.game_data, file, indent=4)
+        logger.info(
+            f"Saved stats for {game.current_level}: {stars} stars, time: {format_time(game.time_taken)}, score: {game.points}")
+    except Exception as e:
+        logger.error(f"Error saving game data: {str(e)}")
 
 def load_level(game, level_name):
     """Load a specific level into the game"""
