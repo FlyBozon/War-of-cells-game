@@ -8,18 +8,6 @@ from typing import List, Dict, Tuple, Optional
 import logging
 import json
 
-
-"""
-- added supporting cells network - additional logic for cells that have some "back" connection with other of the same color, to make them fight better
-- 
-TODO: 
-- change red cells empty cells occupation strategy (currently they always -1 point)
-- add rc graphics
-- additional options in context menu
-- tourn based mode
-- ai based bot and system of calculating the best move in the round
-"""
-
 pygame.init()
 
 logging.basicConfig(
@@ -35,7 +23,7 @@ FPS = 60
 BACKGROUND_COLOR = (10, 10, 20)
 
 CELL_RADIUS = 30
-POINT_GROWTH_INTERVAL = 3000 #ms
+POINT_GROWTH_INTERVAL = 3000  # ms
 BALL_SPEED = 2
 BALL_RADIUS = 5
 BRIDGE_WIDTH = 3
@@ -68,6 +56,12 @@ class EvolutionLevel(Enum):
 class BridgeDirection(Enum):
     ONE_WAY = 0
     TWO_WAY = 1
+
+class AIStrategy(Enum):
+    AGGRESSIVE = 0  # focus on attacking enemy cells
+    DEFENSIVE = 1  #focus on protecting and upgrading own cells
+    EXPANSIVE = 2  # focus on capturing empty cells
+    BALANCED = 3  #mix of all strategies
 
 
 class Cell:
@@ -111,7 +105,6 @@ class Cell:
 
         self.pulse_value = (self.pulse_value + 0.05) % (math.pi * 2)
         self.rotation = (self.rotation + 0.5) % 360
-
 
     def draw(self, screen, game):
         pulse = (math.sin(self.pulse_value) + 1) / 2
@@ -360,7 +353,6 @@ class Ball:
         self.is_support_ball = False
         self.attack_value = source_cell.get_attack_multiplier()
 
-
     def update(self):
         self.trail.append((self.x, self.y))
 
@@ -571,7 +563,6 @@ class Bridge:
         pygame.draw.polygon(screen, color, [(arrow_pos_x, arrow_pos_y), point1, point2])
 
 
-
 class Game:
     def __init__(self):
         self.screen = pygame.display.set_mode((SCREEN_WIDTH, SCREEN_HEIGHT))
@@ -608,13 +599,20 @@ class Game:
         self.time_taken = 0
         self.start_time = 0
 
+        self.ai = CellAI(self, CellType, AIStrategy.BALANCED)
+        self.ai_enabled = True
+        self.ai_difficulty = "Medium"
+
+        self.move_suggester = MoveSuggester(self, CellType)
+        self.show_suggestions = False
+
         self.game_data = load_game_data("game_data.json")
 
         self.show_menu()
 
-        #load_level(self, self.current_level)
+        # load_level(self, self.current_level)
 
-        #self.initialize_board()
+        # self.initialize_board()
 
     def show_menu(self):
         if create_menu(self):
@@ -631,7 +629,7 @@ class Game:
         self.game_over_state = False
         self.points = 0
         self.time_taken = 0
-        self.start_time = pygame.time.get_ticks() / 1000  #start time, seconds
+        self.start_time = pygame.time.get_ticks() / 1000  # start time, seconds
 
         logger.info(f"Starting game with level: {self.current_level}")
 
@@ -652,16 +650,23 @@ class Game:
         """
 
     def switch_turns(self):
+        """Switch to the next player's turn"""
         self.current_player_turn = not self.current_player_turn
         self.turn_time_remaining = 10.0
         self.move_made_this_turn = False
 
         if self.current_player_turn:
             self.turn_status_message = "Your Turn"
+            # Switch to player control when it's player's turn
             self.control_enemy = False
         else:
             self.turn_status_message = "Enemy Turn"
-            self.control_enemy = True
+            if self.ai_enabled:
+                # If AI is enabled, don't switch control to enemy
+                self.control_enemy = False
+            else:
+                # If AI is disabled, switch to enemy control for manual play
+                self.control_enemy = True
 
         logger.info(f"Turn switched to {'Player' if self.current_player_turn else 'Enemy'}")
 
@@ -680,6 +685,33 @@ class Game:
             self.turn_timer_active = False
             self.turn_status_message = ""
             logger.info("Real-time mode activated")
+
+    def toggle_ai(self):
+        """Toggle AI on/off"""
+        self.ai_enabled = not self.ai_enabled
+        if self.ai_enabled:
+            logger.info(f"AI enabled with {self.ai_difficulty} difficulty")
+        else:
+            logger.info("AI disabled")
+
+    def cycle_ai_difficulty(self):
+        """Cycle through AI difficulty levels"""
+        difficulties = ["Easy", "Medium", "Hard"]
+        current_index = difficulties.index(self.ai_difficulty)
+        next_index = (current_index + 1) % len(difficulties)
+        self.ai_difficulty = difficulties[next_index]
+        logger.info(f"AI difficulty set to {self.ai_difficulty}")
+
+        # Update AI strategy based on difficulty
+        if self.ai_difficulty == "Easy":
+            self.ai.strategy = AIStrategy.DEFENSIVE
+        elif self.ai_difficulty == "Medium":
+            self.ai.strategy = AIStrategy.BALANCED
+        else:  # Hard
+            self.ai.strategy = AIStrategy.AGGRESSIVE
+
+        # Update weights
+        self.ai.weights = self.ai._get_strategy_weights(self.ai.strategy)
 
     def create_collision_effect(self, x, y):
         num_particles = random.randint(8, 12)
@@ -753,9 +785,9 @@ class Game:
             elif effect['type'] == 'impact':
                 progress = effect['age'] / effect['lifetime']
                 if progress < 0.3:
-                    effect['size'] = 1.0 + progress * 5  #to 2.5x
+                    effect['size'] = 1.0 + progress * 5  # to 2.5x
                 else:
-                    effect['size'] = 2.5 - (progress - 0.3) * 3  #shrink to 0
+                    effect['size'] = 2.5 - (progress - 0.3) * 3  # shrink to 0
 
         for effect in effects_to_remove:
             if effect in self.effects:
@@ -946,6 +978,13 @@ class Game:
                 current_time_sec = pygame.time.get_ticks() / 1000
                 self.time_taken = current_time_sec - self.start_time
 
+            self.move_suggester.update(pygame.time.get_ticks())
+            if self.show_suggestions:
+                # Only draw suggestions when player's turn in turn-based mode
+                # or when player is controlling player cells in real-time mode
+                if (self.turn_based_mode and self.current_player_turn) or (not self.control_enemy):
+                    self.move_suggester.draw(self.screen)
+
             current_time = pygame.time.get_ticks()
 
             for event in pygame.event.get():
@@ -981,6 +1020,24 @@ class Game:
 
                     elif event.key == pygame.K_t:
                         self.toggle_turn_based_mode()
+
+                    elif event.key == pygame.K_a:
+                        # Toggle AI on/off
+                        self.toggle_ai()
+
+                    elif event.key == pygame.K_d:
+                        # Cycle through AI difficulties
+                        self.cycle_ai_difficulty()
+
+                    elif event.key == pygame.K_h:
+                        # Toggle move suggestions
+                        self.show_suggestions = not self.show_suggestions
+                        if self.show_suggestions:
+                            # Generate new suggestions when toggled on
+                            logger.info("Move suggestions enabled - generating suggestions")
+                            self.move_suggester.generate_suggestions()
+                        else:
+                            logger.info("Move suggestions disabled")
 
 
 
@@ -1052,7 +1109,7 @@ class Game:
                                 self.context_menu_cell = clicked_cell
                                 logger.info(f"Context menu opened for cell at ({clicked_cell.x}, {clicked_cell.y})")
             if self.turn_based_mode and self.turn_timer_active:
-                dt = self.clock.get_time() / 1000.0  #ms to s
+                dt = self.clock.get_time() / 1000.0  # ms to s
                 self.turn_time_remaining -= dt
 
                 if self.turn_time_remaining <= 0 or self.move_made_this_turn:
@@ -1113,7 +1170,7 @@ class Game:
                                 refund_cell = clicked_bridge.source_cell if refund_to_source else clicked_bridge.target_cell
                                 user_controls_cell = (self.control_enemy and refund_cell.cell_type == CellType.ENEMY) or \
                                                      (
-                                                                 not self.control_enemy and refund_cell.cell_type == CellType.PLAYER)
+                                                             not self.control_enemy and refund_cell.cell_type == CellType.PLAYER)
 
                                 if can_remove and user_controls_cell:
                                     bridge_cost = getattr(clicked_bridge, 'creation_cost',
@@ -1134,11 +1191,26 @@ class Game:
 
                                     continue
 
-
             for cell in self.cells:
                 cell.update(current_time)
                 if cell.cell_type != CellType.EMPTY:
                     self.update_evolution_based_on_points(cell)
+
+            if self.ai_enabled:
+                # Adjust AI move cooldown based on difficulty
+                if self.ai_difficulty == "Easy":
+                    self.ai.move_cooldown = 1500  # Slower decision making
+                elif self.ai_difficulty == "Medium":
+                    self.ai.move_cooldown = 1000
+                else:  # Hard
+                    self.ai.move_cooldown = 500  # Faster decision making
+
+                # Update AI
+                self.ai.update(current_time)
+
+                # Every 20 seconds, let AI adjust its strategy based on game state
+                if current_time % 20000 < 50:  # Check within a 50ms window
+                    self.ai.adapt_strategy()
 
             self.spawn_balls(current_time)
 
@@ -1276,9 +1348,9 @@ class Game:
         source_cell.points -= bridge_cost
         logger.info(f"Bridge created. Cost: {bridge_cost} points. Remaining: {source_cell.points}")
 
-        #new_bridge = Bridge(source_cell, target_cell)
+        # new_bridge = Bridge(source_cell, target_cell)
         new_bridge.creation_cost = bridge_cost
-        #self.bridges.append(new_bridge)
+        # self.bridges.append(new_bridge)
 
         source_cell.outgoing_bridges.append(new_bridge)
         target_cell.incoming_bridges.append(new_bridge)
@@ -1429,10 +1501,10 @@ class Game:
             if enemy_cells == 0:
                 self.game_over_state = True
                 save_level_stats(self)
-                self.game_over("Player Wins!")
+                self.game_over("Blue Wins!")
             elif player_cells == 0:
                 self.game_over_state = True
-                self.game_over("Enemy Wins!")
+                self.game_over("Red Wins!")
 
         player_points = sum(cell.points for cell in self.cells if cell.cell_type == CellType.PLAYER)
         enemy_points = sum(cell.points for cell in self.cells if cell.cell_type == CellType.ENEMY)
@@ -1490,6 +1562,31 @@ class Game:
             hint_font = pygame.font.SysFont('Arial', 12)
             hint_surface = hint_font.render(hint_text, True, (150, 150, 150))
             self.screen.blit(hint_surface, (SCREEN_WIDTH - 200, 55))
+        if self.ai_enabled:
+            ai_text = f"AI: ON ({self.ai_difficulty})"
+            ai_color = (200, 255, 200)
+        else:
+            ai_text = "AI: OFF"
+            ai_color = (255, 200, 200)
+
+        ai_surface = self.font.render(ai_text, True, ai_color)
+        self.screen.blit(ai_surface, (SCREEN_WIDTH - 100, SCREEN_HEIGHT - 20))
+
+        # If AI is enabled and it's enemy's turn in turn-based mode
+        if self.ai_enabled and self.turn_based_mode and not self.current_player_turn:
+            thinking_text = "AI thinking..."
+            thinking_surface = self.font.render(thinking_text, True, (255, 255, 100))
+            self.screen.blit(thinking_surface, (SCREEN_WIDTH / 2 - 50, 15))
+
+        if self.show_suggestions:
+            hint_text = "Suggestions: ON (Press H to hide)"
+            hint_color = (200, 255, 200)
+        else:
+            hint_text = "Press H for move suggestions"
+            hint_color = (200, 200, 200)
+
+        hint_surface = self.font.render(hint_text, True, hint_color)
+        self.screen.blit(hint_surface, (20, SCREEN_HEIGHT - 20))
 
     def check_win_condition(self):
         player_cells = sum(1 for cell in self.cells if cell.cell_type == CellType.PLAYER)
@@ -1498,10 +1595,10 @@ class Game:
 
         if empty_cells == 0:
             if player_cells == 0:
-                #self.game_over("Enemy wins! All cells are captured.")
+                # self.game_over("Enemy wins! All cells are captured.")
                 return True
             elif enemy_cells == 0:
-                #self.game_over("Player wins! All cells are captured.")
+                # self.game_over("Player wins! All cells are captured.")
                 return True
 
         return False
@@ -1600,6 +1697,7 @@ class Game:
                                 self.current_level = next_level
                                 self.start_game()
                                 waiting = False
+
     def reset_game(self):
         self.cells = []
         self.bridges = []
@@ -1612,6 +1710,762 @@ class Game:
         self.initialize_board()
         logger.info("Game reset")
 
+
+class CellAI:
+    def __init__(self, game, cell_type_enum, strategy=AIStrategy.BALANCED):
+        self.game = game
+        self.CellType = cell_type_enum
+        self.strategy = strategy
+        self.last_move_time = 0
+        self.move_cooldown = 500
+        self.logger = logging.getLogger('WarOfCellsGame.AI')
+        self.logger.info(f"AI initialized with strategy: {strategy.name}")
+
+        self.weights = self._get_strategy_weights(strategy)
+
+    def _get_strategy_weights(self, strategy):
+        if strategy == AIStrategy.AGGRESSIVE:
+            return {
+                'attack_enemy': 1.0,
+                'capture_empty': 0.6,
+                'upgrade_cell': 0.3,
+                'protect_weak': 0.4,
+                'bridge_creation': 0.7,
+                'distance_factor': 0.5
+            }
+        elif strategy == AIStrategy.DEFENSIVE:
+            return {
+                'attack_enemy': 0.5,
+                'capture_empty': 0.6,
+                'upgrade_cell': 0.8,
+                'protect_weak': 1.0,
+                'bridge_creation': 0.7,
+                'distance_factor': 0.7
+            }
+        elif strategy == AIStrategy.EXPANSIVE:
+            return {
+                'attack_enemy': 0.5,
+                'capture_empty': 1.0,
+                'upgrade_cell': 0.6,
+                'protect_weak': 0.4,
+                'bridge_creation': 0.9,
+                'distance_factor': 0.6
+            }
+        else:
+            return {
+                'attack_enemy': 0.7,
+                'capture_empty': 0.7,
+                'upgrade_cell': 0.7,
+                'protect_weak': 0.7,
+                'bridge_creation': 0.7,
+                'distance_factor': 0.7
+            }
+
+    def update(self, current_time):
+        if self.game.turn_based_mode:
+            if self.game.current_player_turn == False:
+                if current_time - self.last_move_time >= self.move_cooldown:
+                    self._make_move()
+                    self.last_move_time = current_time
+        else:
+            if self.game.control_enemy:
+                if current_time - self.last_move_time >= self.move_cooldown:
+                    self._make_move()
+                    self.last_move_time = current_time
+
+    def _make_move(self):
+        if random.random() < 0.8:
+            current_strategy = self.strategy
+        else:
+            other_strategies = [s for s in AIStrategy if s != self.strategy]
+            current_strategy = random.choice(other_strategies)
+
+        self.weights = self._get_strategy_weights(current_strategy)
+
+        possible_moves = self._get_possible_moves()
+
+        if not possible_moves:
+            self.logger.info("AI: No moves available")
+            if self.game.turn_based_mode and not self.game.current_player_turn:
+                self.game.move_made_this_turn = True
+            return
+
+        best_move = self._select_best_move(possible_moves)
+
+        self._execute_move(best_move)
+        self.logger.info(f"AI executed move: {best_move['type']} - {best_move['description']}")
+
+        if self.game.turn_based_mode and not self.game.current_player_turn:
+            self.game.move_made_this_turn = True
+
+    def _get_possible_moves(self):
+        possible_moves = []
+
+        enemy_cells = [cell for cell in self.game.cells if cell.cell_type == self.CellType.ENEMY]
+        player_cells = [cell for cell in self.game.cells if cell.cell_type == self.CellType.PLAYER]
+        empty_cells = [cell for cell in self.game.cells if cell.cell_type == self.CellType.EMPTY]
+
+        for cell in enemy_cells:
+            if self.game.count_outgoing_bridges(cell) < cell.evolution.value:
+                for target in player_cells:
+                    if not self._bridge_exists(cell, target):
+                        distance = self.game.calculate_distance(cell, target)
+                        bridge_cost = max(1, int(distance / 30))
+
+                        if cell.points >= bridge_cost:
+                            attack_value = self._evaluate_attack(cell, target, bridge_cost)
+                            possible_moves.append({
+                                'type': 'attack',
+                                'source': cell,
+                                'target': target,
+                                'value': attack_value,
+                                'cost': bridge_cost,
+                                'description': f"Attack player cell at ({target.x}, {target.y})"
+                            })
+
+                for target in empty_cells:
+                    if not self._bridge_exists(cell, target):
+                        distance = self.game.calculate_distance(cell, target)
+                        bridge_cost = max(1, int(distance / 30))
+
+                        if cell.points >= bridge_cost:
+                            capture_value = self._evaluate_capture(cell, target, bridge_cost)
+                            possible_moves.append({
+                                'type': 'capture',
+                                'source': cell,
+                                'target': target,
+                                'value': capture_value,
+                                'cost': bridge_cost,
+                                'description': f"Capture empty cell at ({target.x}, {target.y})"
+                            })
+
+                for target in enemy_cells:
+                    if target != cell and not self._bridge_exists(cell, target):
+                        distance = self.game.calculate_distance(cell, target)
+                        bridge_cost = max(1, int(distance / 30))
+
+                        if cell.points >= bridge_cost:
+                            support_value = self._evaluate_support(cell, target, bridge_cost)
+                            possible_moves.append({
+                                'type': 'support',
+                                'source': cell,
+                                'target': target,
+                                'value': support_value,
+                                'cost': bridge_cost,
+                                'description': f"Support enemy cell at ({target.x}, {target.y})"
+                            })
+
+            for bridge in self.game.bridges:
+                if bridge.source_cell == cell:
+                    removal_value = self._evaluate_bridge_removal(bridge)
+                    if removal_value > 0:
+                        possible_moves.append({
+                            'type': 'remove_bridge',
+                            'bridge': bridge,
+                            'value': removal_value,
+                            'description': f"Remove bridge from ({bridge.source_cell.x}, {bridge.source_cell.y}) to ({bridge.target_cell.x}, {bridge.target_cell.y})"
+                        })
+
+            if self.game.turn_based_mode:
+                wait_value = self._evaluate_wait()
+
+                if wait_value > 0:
+                    possible_moves.append({
+                        'type': 'wait',
+                        'value': wait_value,
+                        'description': "Wait and do nothing this turn"
+                    })
+
+        return possible_moves
+
+    def _bridge_exists(self, source, target):
+        for bridge in self.game.bridges:
+            if bridge.source_cell == source and bridge.target_cell == target:
+                return True
+        return False
+
+    def _evaluate_attack(self, source, target, cost):
+        base_value = 50
+
+        distance = self.game.calculate_distance(source, target)
+        max_distance = math.sqrt(SCREEN_WIDTH ** 2 + SCREEN_HEIGHT ** 2)
+        distance_factor = 1 - (distance / max_distance)
+
+        target_strength = target.points
+        target_factor = 100 / (target_strength + 10)
+
+        evolution_factor = target.evolution.value / 3
+
+        attack_multiplier = source.get_attack_multiplier()
+
+        supporting_cells = self.game.count_supporting_cells(source)
+        support_factor = 1 + (supporting_cells * 0.2)
+
+        value = (base_value * self.weights['attack_enemy'] *
+                 distance_factor * self.weights['distance_factor'] *
+                 target_factor * evolution_factor *
+                 attack_multiplier * support_factor) / cost
+
+        return value
+
+    def _evaluate_capture(self, source, target, cost):
+        base_value = 40
+
+        distance = self.game.calculate_distance(source, target)
+        max_distance = math.sqrt(SCREEN_WIDTH ** 2 + SCREEN_HEIGHT ** 2)
+        distance_factor = 1 - (distance / max_distance)
+
+        if target.points_to_capture < target.enemy_points_to_capture:
+            progress_factor = 1.5
+        else:
+            progress_factor = 1.0
+
+        strategic_value = 0
+        for player_cell in [c for c in self.game.cells if c.cell_type == self.CellType.PLAYER]:
+            player_distance = self.game.calculate_distance(target, player_cell)
+            strategic_value += 1 - (player_distance / max_distance)
+        strategic_factor = 1 + min(2, strategic_value)
+
+        value = (base_value * self.weights['capture_empty'] *
+                 distance_factor * self.weights['distance_factor'] *
+                 progress_factor * strategic_factor) / cost
+
+        return value
+
+    def _evaluate_support(self, source, target, cost):
+        base_value = 30
+
+        distance = self.game.calculate_distance(source, target)
+        max_distance = math.sqrt(SCREEN_WIDTH ** 2 + SCREEN_HEIGHT ** 2)
+        distance_factor = 1 - (distance / max_distance)
+
+        incoming_bridges = len(target.incoming_bridges)
+        need_factor = 1 / (incoming_bridges + 1)
+
+        evolution_factor = target.evolution.value / 3
+
+        position_value = 0
+        for player_cell in [c for c in self.game.cells if c.cell_type == self.CellType.PLAYER]:
+            player_distance = self.game.calculate_distance(target, player_cell)
+            position_value += 1 - (player_distance / max_distance)
+        position_factor = 1 + min(1, position_value)
+
+        value = (base_value * self.weights['protect_weak'] *
+                 distance_factor * self.weights['distance_factor'] *
+                 need_factor * evolution_factor * position_factor) / cost
+
+        return value
+
+    def _evaluate_wait(self):
+        base_value = 5
+
+        enemy_cells = [cell for cell in self.game.cells if cell.cell_type == self.CellType.ENEMY]
+        player_cells = [cell for cell in self.game.cells if cell.cell_type == self.CellType.PLAYER]
+        empty_cells = [cell for cell in self.game.cells if cell.cell_type == self.CellType.EMPTY]
+
+        enemy_total_points = sum(cell.points for cell in enemy_cells)
+        player_total_points = sum(cell.points for cell in player_cells)
+
+        if player_total_points > enemy_total_points * 1.5:
+            base_value += 20
+
+        cells_near_evolution = 0
+        for cell in enemy_cells:
+            points_to_evolve = 15 if cell.evolution.value == 1 else 35
+            if 0 < points_to_evolve - cell.points <= 3:
+                cells_near_evolution += 1
+
+        if cells_near_evolution >= 2:
+            base_value += 15 * cells_near_evolution
+
+        for cell in empty_cells:
+            if cell.enemy_points_to_capture > 0 and cell.points_to_capture < cell.enemy_points_to_capture:
+                capture_progress = cell.enemy_points_to_capture / cell.required_points
+                if capture_progress > 0.7:
+                    base_value += 10
+
+        bridges_to_player = 0
+        for bridge in self.game.bridges:
+            if bridge.target_cell.cell_type == self.CellType.PLAYER and bridge.source_cell.cell_type == self.CellType.ENEMY:
+                bridges_to_player += 1
+
+        if bridges_to_player >= 3:
+            base_value += 10
+
+        if enemy_total_points > player_total_points * 1.3 and all(cell.points >= 20 for cell in enemy_cells):
+            base_value += 15
+
+        if self.strategy == AIStrategy.DEFENSIVE:
+            base_value *= 1.5
+        elif self.strategy == AIStrategy.AGGRESSIVE:
+            base_value *= 0.5
+
+        return base_value
+
+    def _select_best_move(self, possible_moves):
+        if not possible_moves:
+            return None
+
+        for move in possible_moves:
+            move['value'] *= random.uniform(0.9, 1.1)
+
+        possible_moves.sort(key=lambda x: x['value'], reverse=True)
+
+        if len(possible_moves) > 1 and random.random() < 0.2:
+            return possible_moves[1]
+        else:
+            return possible_moves[0]
+
+    def _evaluate_bridge_removal(self, bridge):
+        base_value = 5
+
+        if bridge.target_cell.cell_type == self.CellType.PLAYER:
+            if bridge.target_cell.points > bridge.source_cell.points * 1.5:
+                base_value += 15
+
+            base_value += min(20, bridge.source_cell.points / 5)
+
+        elif bridge.target_cell.cell_type == self.CellType.EMPTY:
+            if bridge.target_cell.points_to_capture < bridge.target_cell.enemy_points_to_capture:
+                capture_diff = bridge.target_cell.enemy_points_to_capture - bridge.target_cell.points_to_capture
+                base_value += min(15, capture_diff)
+
+        elif bridge.target_cell.cell_type == self.CellType.ENEMY:
+            if bridge.target_cell.points < 10:
+                target_under_attack = False
+                for other_bridge in self.game.bridges:
+                    if (other_bridge.target_cell == bridge.target_cell and
+                            other_bridge.source_cell.cell_type == self.CellType.PLAYER):
+                        target_under_attack = True
+                        break
+
+                if target_under_attack:
+                    base_value += 10
+                else:
+                    base_value -= 15
+
+        outgoing_bridges = self.game.count_outgoing_bridges(bridge.source_cell)
+        if outgoing_bridges >= bridge.source_cell.evolution.value:
+            base_value += 10
+
+        distance = self.game.calculate_distance(bridge.source_cell, bridge.target_cell)
+        estimated_cost = max(1, int(distance / 30))
+        cost_factor = max(0, 1 - (estimated_cost / 20))
+
+        value = base_value * cost_factor * self.weights['bridge_creation']
+
+        return value
+
+    def _execute_move(self, move):
+        if not move:
+            return
+
+        if move['type'] in ['attack', 'capture', 'support']:
+            self.game.create_bridge(move['source'], move['target'])
+
+            self.logger.info(
+                f"AI executed {move['type']} move: {move['source'].x},{move['source'].y} -> {move['target'].x},{move['target'].y}")
+
+        elif move['type'] == 'remove_bridge':
+            bridge = move['bridge']
+            self.game.remove_bridge(bridge)
+
+            self.logger.info(
+                f"AI removed bridge: {bridge.source_cell.x},{bridge.source_cell.y} -> {bridge.target_cell.x},{bridge.target_cell.y}")
+
+        elif move['type'] == 'wait':
+            self.logger.info("AI decided to wait this turn")
+
+            if self.game.turn_based_mode and not self.game.current_player_turn:
+                self.game.move_made_this_turn = True
+
+    def adapt_strategy(self):
+        player_cells = sum(1 for cell in self.game.cells if cell.cell_type == self.CellType.PLAYER)
+        enemy_cells = sum(1 for cell in self.game.cells if cell.cell_type == self.CellType.ENEMY)
+        empty_cells = sum(1 for cell in self.game.cells if cell.cell_type == self.CellType.EMPTY)
+
+        if player_cells > enemy_cells * 1.5:
+            self.strategy = AIStrategy.DEFENSIVE
+            self.logger.info("AI switched to DEFENSIVE strategy")
+
+        elif enemy_cells > player_cells * 1.5:
+            self.strategy = AIStrategy.AGGRESSIVE
+            self.logger.info("AI switched to AGGRESSIVE strategy")
+
+        elif empty_cells > (player_cells + enemy_cells) * 0.5:
+            self.strategy = AIStrategy.EXPANSIVE
+            self.logger.info("AI switched to EXPANSIVE strategy")
+
+        else:
+            self.strategy = AIStrategy.BALANCED
+            self.logger.info("AI switched to BALANCED strategy")
+
+        self.weights = self._get_strategy_weights(self.strategy)
+
+
+class MoveSuggester:
+    def __init__(self, game, cell_type_enum):
+        self.game = game
+        self.CellType = cell_type_enum
+        self.suggestions = []
+        self.suggestion_active = False
+        self.suggestion_cooldown = 0
+        self.suggestion_display_time = 5000
+        self.logger = logging.getLogger('WarOfCellsGame.MoveSuggester')
+
+    def update(self, current_time):
+        if self.suggestion_cooldown > 0:
+            self.suggestion_cooldown -= self.game.clock.get_time()
+
+            if self.suggestion_active and self.suggestion_cooldown < 0:
+                self.suggestion_active = False
+                self.suggestions = []
+
+    def generate_suggestions(self):
+        if self.suggestion_active:
+            return
+
+        self.suggestions = []
+
+        player_cells = [cell for cell in self.game.cells if cell.cell_type == self.CellType.PLAYER]
+        enemy_cells = [cell for cell in self.game.cells if cell.cell_type == self.CellType.ENEMY]
+        empty_cells = [cell for cell in self.game.cells if cell.cell_type == self.CellType.EMPTY]
+
+        print(
+            f"Generating suggestions - Player cells: {len(player_cells)}, Enemy cells: {len(enemy_cells)}, Empty cells: {len(empty_cells)}")
+
+        attack_suggestions = self._evaluate_attack_moves(player_cells, enemy_cells)
+
+        capture_suggestions = self._evaluate_capture_moves(player_cells, empty_cells)
+
+        support_suggestions = self._evaluate_support_moves(player_cells)
+
+        removal_suggestions = self._evaluate_bridge_removal(player_cells)
+
+        print(
+            f"Found suggestions - Attack: {len(attack_suggestions)}, Capture: {len(capture_suggestions)}, Support: {len(support_suggestions)}, Remove: {len(removal_suggestions)}")
+
+        all_suggestions = attack_suggestions + capture_suggestions + support_suggestions + removal_suggestions
+        all_suggestions.sort(key=lambda x: x['score'], reverse=True)
+
+        self.suggestions = all_suggestions[:3]
+
+        self.suggestion_active = True
+        self.suggestion_cooldown = self.suggestion_display_time
+
+        print(f"Final suggestions: {len(self.suggestions)}")
+        for i, s in enumerate(self.suggestions):
+            print(f"  {i + 1}: {s['description']} (Score: {s.get('score', 0)})")
+
+    def _evaluate_attack_moves(self, player_cells, enemy_cells):
+        suggestions = []
+
+        for source in player_cells:
+            if self.game.count_outgoing_bridges(source) >= source.evolution.value:
+                continue
+
+            for target in enemy_cells:
+                if self._bridge_exists(source, target):
+                    continue
+
+                distance = self.game.calculate_distance(source, target)
+                bridge_cost = max(1, int(distance / 30))
+
+                if source.points < bridge_cost:
+                    continue
+
+                score = self._score_attack(source, target, bridge_cost)
+
+                if score > 0:
+                    suggestions.append({
+                        'type': 'attack',
+                        'source': source,
+                        'target': target,
+                        'score': score,
+                        'cost': bridge_cost,
+                        'description': f"Attack enemy cell ({target.x}, {target.y}) from ({source.x}, {source.y})"
+                    })
+
+        return suggestions
+
+    def _evaluate_capture_moves(self, player_cells, empty_cells):
+        suggestions = []
+
+        for source in player_cells:
+            if self.game.count_outgoing_bridges(source) >= source.evolution.value:
+                continue
+
+            for target in empty_cells:
+                if self._bridge_exists(source, target):
+                    continue
+
+                distance = self.game.calculate_distance(source, target)
+                bridge_cost = max(1, int(distance / 30))
+
+                if source.points < bridge_cost:
+                    continue
+
+                score = self._score_capture(source, target, bridge_cost)
+
+                if score > 0:
+                    suggestions.append({
+                        'type': 'capture',
+                        'source': source,
+                        'target': target,
+                        'score': score,
+                        'cost': bridge_cost,
+                        'description': f"Capture empty cell ({target.x}, {target.y}) from ({source.x}, {source.y})"
+                    })
+
+        return suggestions
+
+    def _evaluate_support_moves(self, player_cells):
+        suggestions = []
+
+        for source in player_cells:
+            if self.game.count_outgoing_bridges(source) >= source.evolution.value:
+                continue
+
+            for target in player_cells:
+                if source == target:
+                    continue
+
+                if self._bridge_exists(source, target):
+                    continue
+
+                distance = self.game.calculate_distance(source, target)
+                bridge_cost = max(1, int(distance / 30))
+
+                if source.points < bridge_cost:
+                    continue
+
+                score = self._score_support(source, target, bridge_cost)
+
+                if score > 0:
+                    suggestions.append({
+                        'type': 'support',
+                        'source': source,
+                        'target': target,
+                        'score': score,
+                        'cost': bridge_cost,
+                        'description': f"Support allied cell ({target.x}, {target.y}) from ({source.x}, {source.y})"
+                    })
+
+        return suggestions
+
+    def _evaluate_bridge_removal(self, player_cells):
+        suggestions = []
+
+        for cell in player_cells:
+            for bridge in self.game.bridges:
+                if bridge.source_cell == cell:
+                    score = self._score_bridge_removal(bridge)
+
+                    if score > 0:
+                        suggestions.append({
+                            'type': 'remove',
+                            'bridge': bridge,
+                            'score': score,
+                            'description': f"Remove bridge from ({bridge.source_cell.x}, {bridge.source_cell.y}) to ({bridge.target_cell.x}, {bridge.target_cell.y})"
+                        })
+
+        return suggestions
+
+    def _bridge_exists(self, source, target):
+        for bridge in self.game.bridges:
+            if bridge.source_cell == source and bridge.target_cell == target:
+                return True
+        return False
+
+    def _score_attack(self, source, target, cost):
+        score = 50
+
+        if target.points < 15:
+            score += 20
+        elif target.points < 30:
+            score += 10
+
+        points_to_evolve = 15 if target.evolution.value == 1 else 35
+        if points_to_evolve - target.points < 5:
+            score += 15
+
+        score += target.evolution.value * 5
+
+        supporting_cells = self.game.count_supporting_cells(source)
+        score += supporting_cells * 10
+
+        score *= source.get_attack_multiplier()
+
+        score = score / cost
+
+        return score
+
+    def _score_capture(self, source, target, cost):
+        score = 40
+
+        if target.points_to_capture > 0:
+            capture_progress = target.points_to_capture / target.required_points
+            score += capture_progress * 30
+
+        for enemy_cell in [c for c in self.game.cells if c.cell_type == self.CellType.ENEMY]:
+            distance = self.game.calculate_distance(target, enemy_cell)
+            if distance < 150:
+                score += 15
+                break
+
+        score = score / cost
+
+        return score
+
+    def _score_support(self, source, target, cost):
+        score = 30
+
+        if target.points < 15:
+            score += 15
+
+        score += target.evolution.value * 5
+
+        target_engaged = False
+        for bridge in self.game.bridges:
+            if bridge.source_cell == target and bridge.target_cell.cell_type == self.CellType.ENEMY:
+                target_engaged = True
+                score += 20
+                break
+
+        score = score / cost
+
+        return score
+
+    def _score_bridge_removal(self, bridge):
+        score = 0
+
+        if bridge.target_cell.cell_type == self.CellType.EMPTY:
+            if bridge.target_cell.enemy_points_to_capture > bridge.target_cell.points_to_capture:
+                score += 20
+
+        elif bridge.target_cell.cell_type == self.CellType.ENEMY:
+            if bridge.target_cell.points > bridge.source_cell.points * 1.5:
+                score += 25
+
+        if self.game.count_outgoing_bridges(bridge.source_cell) >= bridge.source_cell.evolution.value:
+            score += 15
+
+        return score
+
+    def draw(self, screen):
+        if not self.suggestion_active or not self.suggestions:
+            return
+
+        font = pygame.font.SysFont('Arial', 16, bold=True)
+
+        for i, suggestion in enumerate(self.suggestions):
+            if suggestion['type'] == 'attack':
+                color = (255, 50, 50)
+            elif suggestion['type'] == 'capture':
+                color = (50, 255, 50)
+            elif suggestion['type'] == 'support':
+                color = (50, 100, 255)
+            elif suggestion['type'] == 'remove':
+                color = (255, 100, 0)
+            else:
+                color = (255, 255, 0)
+
+            if suggestion['type'] in ['attack', 'capture', 'support']:
+                source = suggestion['source']
+                target = suggestion['target']
+
+                pygame.draw.line(screen, color,
+                                 (source.x, source.y),
+                                 (target.x, target.y), 4)
+
+                pygame.draw.circle(screen, color, (source.x, source.y), 10, 3)
+                pygame.draw.circle(screen, color, (target.x, target.y), 10, 3)
+
+                rank_text = str(i + 1)
+                text_surf = font.render(rank_text, True, (255, 255, 255))
+                text_bg = pygame.Surface((text_surf.get_width() + 10, text_surf.get_height() + 10))
+                text_bg.fill(color)
+
+                mid_x = (source.x + target.x) // 2
+                mid_y = (source.y + target.y) // 2
+
+                screen.blit(text_bg, (mid_x - text_surf.get_width() // 2 - 5,
+                                      mid_y - text_surf.get_height() // 2 - 5))
+                screen.blit(text_surf, (mid_x - text_surf.get_width() // 2,
+                                        mid_y - text_surf.get_height() // 2))
+
+            elif suggestion['type'] == 'remove':
+                bridge = suggestion['bridge']
+                source_x, source_y = bridge.source_cell.x, bridge.source_cell.y
+                target_x, target_y = bridge.target_cell.x, bridge.target_cell.y
+
+                mid_x = (source_x + target_x) // 2
+                mid_y = (source_y + target_y) // 2
+
+                x_size = 20
+                line_width = 4
+
+                pygame.draw.line(screen, color,
+                                 (mid_x - x_size, mid_y - x_size),
+                                 (mid_x + x_size, mid_y + x_size), line_width)
+                pygame.draw.line(screen, color,
+                                 (mid_x - x_size, mid_y + x_size),
+                                 (mid_x + x_size, mid_y - x_size), line_width)
+
+                pygame.draw.circle(screen, color, (mid_x, mid_y), x_size + 5, 2)
+
+                rank_text = str(i + 1)
+                text_surf = font.render(rank_text, True, (255, 255, 255))
+                text_bg = pygame.Surface((text_surf.get_width() + 10, text_surf.get_height() + 10))
+                text_bg.fill(color)
+
+                text_x = mid_x - text_surf.get_width() // 2
+                text_y = mid_y - x_size - text_surf.get_height() - 10
+
+                screen.blit(text_bg, (text_x - 5, text_y - 5))
+                screen.blit(text_surf, (text_x, text_y))
+
+    def _draw_dashed_line(self, surface, start, end, color, width, dash_length=10):
+        x1, y1 = start
+        x2, y2 = end
+
+        dx = x2 - x1
+        dy = y2 - y1
+        distance = math.sqrt(dx ** 2 + dy ** 2)
+
+        if distance == 0:
+            return
+
+        dx, dy = dx / distance, dy / distance
+
+        segments = int(distance / dash_length)
+
+        segments = max(2, segments)
+
+        dash = True
+
+        for i in range(segments):
+            start_x = x1 + dx * i * dash_length
+            start_y = y1 + dy * i * dash_length
+
+            if dash:
+                end_x = min(x2, x1 + dx * (i + 0.5) * dash_length)
+                end_y = min(y2, y1 + dy * (i + 0.5) * dash_length)
+                pygame.draw.line(surface, color, (start_x, start_y), (end_x, end_y), width)
+
+            dash = not dash
+
+    def _draw_arrowhead(self, surface, position, direction, color, size):
+        x, y = position
+        dx, dy = direction
+
+        perp_x, perp_y = -dy, dx
+
+        point1 = (x, y)
+        point2 = (x - dx * size - perp_x * size / 2, y - dy * size - perp_y * size / 2)
+        point3 = (x - dx * size + perp_x * size / 2, y - dy * size + perp_y * size / 2)
+
+        pygame.draw.polygon(surface, color, [point1, point2, point3])
 
 def load_game_data(file_path):
     try:
@@ -1796,7 +2650,7 @@ def calculate_stars(points, time_taken):
 
 
 def format_time(seconds):
-    #format seconds into MM:SS
+    # format seconds into MM:SS
     minutes = int(seconds // 60)
     secs = int(seconds % 60)
     return f"{minutes:02d}:{secs:02d}"
@@ -1827,6 +2681,7 @@ def save_level_stats(game):
             f"Saved stats for {game.current_level}: {stars} stars, time: {format_time(game.time_taken)}, score: {game.points}")
     except Exception as e:
         logger.error(f"Error saving game data: {str(e)}")
+
 
 def load_level(game, level_name):
     game.cells = []
@@ -1899,7 +2754,8 @@ def load_level(game, level_name):
     except Exception as e:
         logger.error(f"Error loading level {level_name}: {str(e)}")
         return False
-    
+
+
 if __name__ == "__main__":
     game = Game()
     game.run()
