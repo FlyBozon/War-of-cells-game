@@ -3,11 +3,16 @@ import sys
 import math
 import random
 import colorsys
-from enum import Enum
+from enum import Enum, auto
 from typing import List, Dict, Tuple, Optional
 import logging
 import json
 from level_editor import *
+from initial_menu_window import *
+from game_recorder import *
+from game_playback import *
+from client import *
+from server import *
 
 pygame.init()
 
@@ -63,6 +68,28 @@ class AIStrategy(Enum):
     DEFENSIVE = 1  #focus on protecting and upgrading own cells
     EXPANSIVE = 2  # focus on capturing empty cells
     BALANCED = 3  #mix of all strategies
+
+class GameType(Enum):
+    SINGLE_PLAYER=0
+    LOCAL_MULTI=1
+    ONLINE=2
+
+    @classmethod
+    def from_string(cls, name):
+        name_map = {
+            "Single player": cls.SINGLE_PLAYER,
+            "Local multiplayer": cls.LOCAL_MULTI,
+            "Online game": cls.ONLINE
+        }
+        return name_map.get(name, cls.SINGLE_PLAYER)
+
+    def to_string(self):
+        string_map = {
+            GameType.SINGLE_PLAYER: "Single player",
+            GameType.LOCAL_MULTI: "Local multiplayer",
+            GameType.ONLINE: "Online game"
+        }
+        return string_map.get(self, "Single player")
 
 
 class Cell:
@@ -293,6 +320,8 @@ class Cell:
         if self.cell_type != CellType.EMPTY:
             return False
 
+        original_type = self.cell_type
+
         if is_player:
             self.points_to_capture += points_gained
         else:
@@ -313,6 +342,16 @@ class Cell:
             self.points_to_capture = 0
             self.enemy_points_to_capture = 0
             return True
+
+        if original_type == CellType.EMPTY and self.cell_type != CellType.EMPTY:
+            game = self.game
+            if not game.playback_active:
+                game.game_recorder.record_event("CELL_CAPTURED", {
+                    "cellId": game.game_recorder.cell_id_map.get(self, -1),
+                    "newType": self.cell_type.name,
+                    "points": self.points,
+                    "isPlayer": is_player
+                })
 
         return False
 
@@ -599,14 +638,6 @@ class Game:
         self.points = 0
         self.time_taken = 0
         self.start_time = 0
-        """
-        self.ai = CellAI(self, CellType, AIStrategy.BALANCED)
-        self.ai_enabled = True
-        self.ai_difficulty = "Medium"
-
-        self.move_suggester = MoveSuggester(self, CellType)
-        self.show_suggestions = False
-        """
 
         self.ai_enabled = True
         self.ai_difficulty = "Medium"
@@ -616,13 +647,49 @@ class Game:
         self.show_suggestions = False
         self.last_suggestion_time = 0
 
-        self.game_data = load_game_data("game_data.json")
+        self.game_type = GameType.SINGLE_PLAYER
 
-        self.show_menu()
+        self.network_config = {
+            "ip": "127.0.0.1",
+            "port": 12345
+        }
+
+        self.game_recorder = GameRecorder(self)
+        self.game_playback = None
+        self.playback_active = False
+        self.playback_controls_visible = False
+
+        self.game_data = load_game_data("game_data.json")
+        self.show_first_menu()
+
+        #self.show_menu()
 
         # load_level(self, self.current_level)
 
         # self.initialize_board()
+
+    def show_first_menu(self):
+        menu = MenuWindow()
+        if menu.config:
+            self.game_type = GameType.from_string(menu.config["mode"])
+
+            if self.game_type == GameType.SINGLE_PLAYER:
+                self.ai_enabled = True
+                self.control_enemy = False
+            elif self.game_type == GameType.LOCAL_MULTI:
+                self.ai_enabled = False
+                self.control_enemy = False
+                self.turn_based_mode = True
+            elif self.game_type == GameType.ONLINE:
+                self.ai_enabled = False
+                self.network_config["ip"] = menu.config["ip"]
+                self.network_config["port"] = menu.config["port"]
+
+            logger.info(f"Selected game mode: {self.game_type.to_string()}")
+
+            self.show_menu()
+        else:
+            self.running = False
 
     def show_menu(self):
         if create_menu(self):
@@ -631,6 +698,14 @@ class Game:
             self.running = False
 
     def start_game(self):
+        saved_games = check_saved_games_for_level(self.current_level)
+        if saved_games:
+            if self.show_continue_dialog(saved_games[0]):
+                if self.load_saved_game(saved_games[0]):
+                    self.game_started = True
+                    self.game_over_state = False
+                    logger.info(f"Continuing saved game for level: {self.current_level}")
+                    return
         load_level(self, self.current_level)
 
         self.game_started = True
@@ -641,6 +716,12 @@ class Game:
 
         logger.info(f"Starting game with level: {self.current_level}")
 
+        if self.game_type == GameType.ONLINE:
+            logger.info(f"Connecting to {self.network_config['ip']}:{self.network_config['port']}")
+
+        if not self.playback_active:
+            self.game_recorder.start_recording()
+
     def initialize_board(self):
         player_cell = Cell(200, 300, CellType.PLAYER, CellShape.CIRCLE, EvolutionLevel.LEVEL_1)
         self.cells.append(player_cell)
@@ -648,17 +729,7 @@ class Game:
         enemy_cell = Cell(600, 300, CellType.ENEMY, CellShape.CIRCLE, EvolutionLevel.LEVEL_1)
         self.cells.append(enemy_cell)
 
-        """
-        for _ in range(8):
-            x = random.randint(100, SCREEN_WIDTH - 100)
-            y = random.randint(100, SCREEN_HEIGHT - 100)
-            shape = random.choice(list(CellShape))
-            empty_cell = Cell(x, y, CellType.EMPTY, shape)
-            self.cells.append(empty_cell)
-        """
-
     def switch_turns(self):
-        """Switch to the next player's turn"""
         self.current_player_turn = not self.current_player_turn
         self.turn_time_remaining = 10.0
         self.move_made_this_turn = False
@@ -674,6 +745,11 @@ class Game:
                 self.control_enemy = True
 
         logger.info(f"Turn switched to {'Player' if self.current_player_turn else 'Enemy'}")
+
+        if not self.playback_active:
+            self.game_recorder.record_event("TURN_SWITCH", {
+                "isPlayerTurn": self.current_player_turn
+            })
 
     def toggle_turn_based_mode(self):
         self.turn_based_mode = not self.turn_based_mode
@@ -692,7 +768,6 @@ class Game:
             logger.info("Real-time mode activated")
 
     def toggle_ai(self):
-        """Toggle AI on/off"""
         self.ai_enabled = not self.ai_enabled
         if self.ai_enabled:
             logger.info(f"AI enabled with {self.ai_difficulty} difficulty")
@@ -700,7 +775,6 @@ class Game:
             logger.info("AI disabled")
 
     def cycle_ai_difficulty(self):
-        """Cycle through AI difficulty levels"""
         difficulties = ["Easy", "Medium", "Hard"]
         current_index = difficulties.index(self.ai_difficulty)
         next_index = (current_index + 1) % len(difficulties)
@@ -812,6 +886,13 @@ class Game:
                 self.create_impact_effect(cell.x, cell.y, True)
             else:
                 self.create_impact_effect(cell.x, cell.y, False)
+
+        if new_evolution.value != old_evolution and not self.playback_active:
+            self.game_recorder.record_event("CELL_EVOLVED", {
+                "cellId": self.game_recorder.cell_id_map.get(cell, -1),
+                "oldLevel": old_evolution,
+                "newLevel": new_evolution.value
+            })
 
     def next_level(self):
         if not self.game_data:
@@ -963,6 +1044,12 @@ class Game:
         if bridge in self.bridges:
             self.bridges.remove(bridge)
 
+        if not self.playback_active:
+            self.game_recorder.record_event("BRIDGE_REMOVED", {
+                "sourceId": self.game_recorder.cell_id_map.get(bridge.source_cell, -1),
+                "targetId": self.game_recorder.cell_id_map.get(bridge.target_cell, -1)
+            })
+
     def run(self):
         running = True
         creating_bridge = False
@@ -975,346 +1062,376 @@ class Game:
                 self.show_menu()
                 continue
 
-            if not self.game_over_state:
-                current_time_sec = pygame.time.get_ticks() / 1000
-                self.time_taken = current_time_sec - self.start_time
+            if self.playback_active and self.game_playback:
+                self.game_playback.update()
 
-            current_time = pygame.time.get_ticks()
-            if self.ai_enabled and not self.control_enemy:  #
-                if self.turn_based_mode:
-                    if not self.current_player_turn and current_time - self.last_ai_move_time >= self.ai_move_cooldown:
-                        execute_ai_move(self, is_suggestion=False)
-                        self.last_ai_move_time = current_time
-                else:
-                    # In real-time mode, periodically make enemy moves
-                    if current_time - self.last_ai_move_time >= self.ai_move_cooldown:
-                        execute_ai_move(self, is_suggestion=False)
-                        self.last_ai_move_time = current_time
+                self.screen.blit(background, (0, 0))
 
-            if self.show_suggestions:
-                if (self.turn_based_mode and self.current_player_turn) or (not self.control_enemy):
-                    if not self.suggestions or current_time - self.last_suggestion_time >= 5000:
-                        self.suggestions = suggest_moves(self, for_player=True)
-                        self.last_suggestion_time = current_time
+                for bridge in self.bridges:
+                    bridge.draw(self.screen)
 
-                    draw_suggestions(self, self.screen)
+                for cell in self.cells:
+                    cell.draw(self.screen, self)
 
-            for event in pygame.event.get():
-                if event.type == pygame.QUIT:
-                    running = False
+                for ball in self.balls:
+                    ball.draw(self.screen)
 
-                elif event.type == pygame.KEYDOWN:
-                    if event.key == pygame.K_SPACE:
-                        self.control_enemy = not self.control_enemy
-                        if self.control_enemy:
-                            logger.info("Now controlling enemy (red) cells")
-                            for cell in self.cells:
-                                if cell.cell_type == CellType.ENEMY:
-                                    self.create_impact_effect(cell.x, cell.y, False)
-                        else:
-                            logger.info("Now controlling player (blue) cells")
-                            for cell in self.cells:
-                                if cell.cell_type == CellType.PLAYER:
-                                    self.create_impact_effect(cell.x, cell.y, True)
-                                    """
-                    elif event.key == pygame.K_e:
-                        mouse_pos = pygame.mouse.get_pos()
-                        clicked_cell = self.get_cell_at_position(mouse_pos[0], mouse_pos[1])
+                self.draw_playback_controls()
 
-                        if clicked_cell:
-                            if (self.control_enemy and clicked_cell.cell_type == CellType.ENEMY) or \
-                                    (not self.control_enemy and clicked_cell.cell_type == CellType.PLAYER):
-                                self.selected_cell = clicked_cell
-                                self.create_impact_effect(self.selected_cell.x, self.selected_cell.y,
-                                                          not self.control_enemy)
-                                logger.info(f"Selected cell at ({clicked_cell.x}, {clicked_cell.y})") """
+            else:
 
-                    elif event.key == pygame.K_t:
-                        self.toggle_turn_based_mode()
+                if not self.game_over_state:
+                    current_time_sec = pygame.time.get_ticks() / 1000
+                    self.time_taken = current_time_sec - self.start_time
 
-                    elif event.key == pygame.K_a:
-                        self.toggle_ai()
+                current_time = pygame.time.get_ticks()
+                if self.ai_enabled and not self.control_enemy:
+                    if self.turn_based_mode:
+                        if not self.current_player_turn and current_time - self.last_ai_move_time >= self.ai_move_cooldown:
+                            execute_ai_move(self, is_suggestion=False)
+                            self.last_ai_move_time = current_time
+                    else:
+                        if current_time - self.last_ai_move_time >= self.ai_move_cooldown:
+                            execute_ai_move(self, is_suggestion=False)
+                            self.last_ai_move_time = current_time
 
-                    elif event.key == pygame.K_d:
-                        self.cycle_ai_difficulty()
 
-                    elif event.key == pygame.K_h:
-                        self.show_suggestions = not self.show_suggestions
-                        if self.show_suggestions:
-                            logger.info("Move suggestions enabled - generating suggestions")
+                if self.show_suggestions:
+                    if (self.turn_based_mode and self.current_player_turn) or (not self.control_enemy):
+                        if not self.suggestions or current_time - self.last_suggestion_time >= 5000:
                             self.suggestions = suggest_moves(self, for_player=True)
-                            print(f"Generated {len(self.suggestions)} suggestions")
-                            for s in self.suggestions:
-                                print(f"Suggestion: {s.get('description')} ({s.get('type')})")
-                        else:
-                            logger.info("Move suggestions disabled")
-                            self.suggestions = []
+                            self.last_suggestion_time = current_time
+
+                        draw_suggestions(self, self.screen)
+
+                for event in pygame.event.get():
+                    if event.type == pygame.QUIT:
+                        running = False
+
+                    elif self.playback_active and self.game_playback:
+                        if event.type == pygame.KEYDOWN:
+                            if event.key == pygame.K_SPACE:
+                                if self.game_playback.is_playing:
+                                    self.game_playback.pause()
+                                else:
+                                    self.game_playback.resume()
+                            elif event.key == pygame.K_RIGHT:
+                                self.game_playback.set_speed(self.game_playback.playback_speed + 0.25)
+                            elif event.key == pygame.K_LEFT:
+                                self.game_playback.set_speed(self.game_playback.playback_speed - 0.25)
+                            elif event.key == pygame.K_ESCAPE:
+                                self.playback_active = False
+                                self.game_playback = None
+                                self.game_started = False
+                                continue
+
+                    elif event.type == pygame.KEYDOWN:
+                        if event.key == pygame.K_SPACE and (self.game_type == GameType.LOCAL_MULTI or self.game_type==GameType.ONLINE):
+                            self.control_enemy = not self.control_enemy
+                            if self.control_enemy:
+                                logger.info("Now controlling enemy (red) cells")
+                                for cell in self.cells:
+                                    if cell.cell_type == CellType.ENEMY:
+                                        self.create_impact_effect(cell.x, cell.y, False)
+                            else:
+                                logger.info("Now controlling player (blue) cells")
+                                for cell in self.cells:
+                                    if cell.cell_type == CellType.PLAYER:
+                                        self.create_impact_effect(cell.x, cell.y, True)
+
+                        elif event.key == pygame.K_t:
+                            self.toggle_turn_based_mode()
+
+                        #commented that part, as ai is only available for single player, and makes no sense to other, and if it is single player it automatically playes against ai
+                        # elif event.key == pygame.K_a:
+                            # self.toggle_ai()
+
+                        #same for game difficulty - if I want to save it in game history, it must be chosen at the beginning
+                        #elif event.key == pygame.K_d:
+                            #self.cycle_ai_difficulty()
+
+                        #help is currently available only in single player mode, maybe later add it to others
+                        elif event.key == pygame.K_h and self.game_type==GameType.SINGLE_PLAYER:
+                            self.show_suggestions = not self.show_suggestions
+                            if self.show_suggestions:
+                                logger.info("Move suggestions enabled - generating suggestions")
+                                self.suggestions = suggest_moves(self, for_player=True)
+                                print(f"Generated {len(self.suggestions)} suggestions")
+                                for s in self.suggestions:
+                                    print(f"Suggestion: {s.get('description')} ({s.get('type')})")
+                            else:
+                                logger.info("Move suggestions disabled")
+                                self.suggestions = []
+
+                        elif event.key == pygame.K_s:
+                            if not self.playback_active:
+                                self.save_game_progress()
+                                continue
 
 
+                    elif event.type == pygame.MOUSEBUTTONDOWN:
+                        if event.button == 1:  # Left click
+                            mouse_pos = pygame.mouse.get_pos()
+                            clicked_cell = self.get_cell_at_position(mouse_pos[0], mouse_pos[1])
 
-                elif event.type == pygame.MOUSEBUTTONDOWN:
-                    if event.button == 1:  # Left click
-                        mouse_pos = pygame.mouse.get_pos()
-                        clicked_cell = self.get_cell_at_position(mouse_pos[0], mouse_pos[1])
+                            if clicked_cell:
+                                if not creating_bridge:
+                                    if (self.control_enemy and clicked_cell.cell_type == CellType.ENEMY) or \
+                                            (not self.control_enemy and clicked_cell.cell_type == CellType.PLAYER):
+                                        creating_bridge = True
+                                        bridge_start_cell = clicked_cell
+                                        self.create_impact_effect(clicked_cell.x, clicked_cell.y,
+                                                                  not self.control_enemy)
+                                else:
+                                    if clicked_cell != bridge_start_cell:
+                                        if self.create_bridge(bridge_start_cell, clicked_cell):
+                                            self.create_impact_effect(clicked_cell.x, clicked_cell.y,
+                                                                      not self.control_enemy)
+                                    creating_bridge = False
+                                    bridge_start_cell = None
+                            else:
+                                clicked_bridge, refund_to_source = self.get_bridge_at_position(mouse_pos[0], mouse_pos[1])
 
-                        if clicked_cell:
-                            if not creating_bridge:
+                                if clicked_bridge:
+                                    refund_cell = clicked_bridge.source_cell if refund_to_source else clicked_bridge.target_cell
+                                    can_remove = False
+
+                                    if (self.control_enemy and refund_cell.cell_type == CellType.ENEMY) or \
+                                            (not self.control_enemy and refund_cell.cell_type == CellType.PLAYER):
+                                        can_remove = True
+
+                                    if can_remove:
+                                        bridge_cost = getattr(clicked_bridge, 'creation_cost',
+                                                              1)
+                                        self.remove_bridge(clicked_bridge)
+
+                                        refund_cell.points += bridge_cost
+
+                                        self.create_impact_effect(refund_cell.x, refund_cell.y,
+                                                                  refund_cell.cell_type == CellType.PLAYER)
+                                        logger.info(
+                                            f"Bridge removed. Refunded {bridge_cost} points to cell at ({refund_cell.x}, {refund_cell.y})")
+
+                                        continue
+
+                            if self.show_context_menu:
+                                if self.menu_rect.collidepoint(mouse_pos):
+                                    option_index = (mouse_pos[1] - self.menu_rect.y) // 30
+                                    if option_index == 0:
+                                        logger.info(f"All connections are removed")
+                                        self.remove_all_bridges_from_cell(self.context_menu_cell)
+
+                                self.show_context_menu = False
+                                self.context_menu_cell = None
+                                continue
+
+                        elif event.button == 3:  # Right click
+                            mouse_pos = pygame.mouse.get_pos()
+                            clicked_cell = self.get_cell_at_position(mouse_pos[0], mouse_pos[1])
+
+                            if clicked_cell:
                                 if (self.control_enemy and clicked_cell.cell_type == CellType.ENEMY) or \
                                         (not self.control_enemy and clicked_cell.cell_type == CellType.PLAYER):
-                                    creating_bridge = True
-                                    bridge_start_cell = clicked_cell
-                                    self.create_impact_effect(clicked_cell.x, clicked_cell.y,
-                                                              not self.control_enemy)
-                            else:
-                                if clicked_cell != bridge_start_cell:
-                                    if self.create_bridge(bridge_start_cell, clicked_cell):
+                                    self.show_context_menu = True
+                                    self.context_menu_cell = clicked_cell
+                                    logger.info(f"Context menu opened for cell at ({clicked_cell.x}, {clicked_cell.y})")
+
+                if self.turn_based_mode and self.turn_timer_active:
+                    dt = self.clock.get_time() / 1000.0  # ms to s
+                    self.turn_time_remaining -= dt
+
+                    if self.turn_time_remaining <= 0 or self.move_made_this_turn:
+                        self.switch_turns()
+                    elif event.type == pygame.MOUSEBUTTONDOWN:
+                        if event.button == 1:  # Left click
+                            mouse_pos = pygame.mouse.get_pos()
+                            clicked_cell = self.get_cell_at_position(mouse_pos[0], mouse_pos[1])
+
+                            if clicked_cell:
+                                if not creating_bridge:
+                                    can_start_bridge = True
+
+                                    if self.turn_based_mode:
+                                        is_player_cell = clicked_cell.cell_type == CellType.PLAYER
+                                        is_enemy_cell = clicked_cell.cell_type == CellType.ENEMY
+
+                                        if (is_player_cell and not self.current_player_turn) or \
+                                                (is_enemy_cell and self.current_player_turn):
+                                            can_start_bridge = False
+                                            logger.info("Not your turn to create a bridge")
+
+                                    if can_start_bridge and (
+                                            (self.control_enemy and clicked_cell.cell_type == CellType.ENEMY) or \
+                                            (not self.control_enemy and clicked_cell.cell_type == CellType.PLAYER)):
+                                        creating_bridge = True
+                                        bridge_start_cell = clicked_cell
                                         self.create_impact_effect(clicked_cell.x, clicked_cell.y,
                                                                   not self.control_enemy)
-                                creating_bridge = False
-                                bridge_start_cell = None
-                        else:
-                            clicked_bridge, refund_to_source = self.get_bridge_at_position(mouse_pos[0], mouse_pos[1])
+                                else:
+                                    if clicked_cell != bridge_start_cell:
+                                        if self.create_bridge(bridge_start_cell, clicked_cell):
+                                            self.create_impact_effect(clicked_cell.x, clicked_cell.y,
+                                                                      not self.control_enemy)
 
-                            if clicked_bridge:
-                                refund_cell = clicked_bridge.source_cell if refund_to_source else clicked_bridge.target_cell
-                                can_remove = False
+                                            if self.turn_based_mode:
+                                                self.move_made_this_turn = True
+                                                self.switch_turns()
 
-                                if (self.control_enemy and refund_cell.cell_type == CellType.ENEMY) or \
-                                        (not self.control_enemy and refund_cell.cell_type == CellType.PLAYER):
+                                    creating_bridge = False
+                                    bridge_start_cell = None
+                            else:
+                                clicked_bridge, refund_to_source = self.get_bridge_at_position(mouse_pos[0], mouse_pos[1])
+
+                                if clicked_bridge:
                                     can_remove = True
 
-                                if can_remove:
-                                    bridge_cost = getattr(clicked_bridge, 'creation_cost',
-                                                          1)
-                                    self.remove_bridge(clicked_bridge)
+                                    if self.turn_based_mode:
+                                        refund_cell = clicked_bridge.source_cell if refund_to_source else clicked_bridge.target_cell
+                                        is_player_bridge = refund_cell.cell_type == CellType.PLAYER
+                                        is_enemy_bridge = refund_cell.cell_type == CellType.ENEMY
 
-                                    refund_cell.points += bridge_cost
+                                        if (is_player_bridge and not self.current_player_turn) or \
+                                                (is_enemy_bridge and self.current_player_turn):
+                                            can_remove = False
+                                            logger.info("Not your turn to remove this bridge")
 
-                                    self.create_impact_effect(refund_cell.x, refund_cell.y,
-                                                              refund_cell.cell_type == CellType.PLAYER)
-                                    logger.info(
-                                        f"Bridge removed. Refunded {bridge_cost} points to cell at ({refund_cell.x}, {refund_cell.y})")
+                                    refund_cell = clicked_bridge.source_cell if refund_to_source else clicked_bridge.target_cell
+                                    user_controls_cell = (self.control_enemy and refund_cell.cell_type == CellType.ENEMY) or \
+                                                         (
+                                                                 not self.control_enemy and refund_cell.cell_type == CellType.PLAYER)
 
-                                    continue
+                                    if can_remove and user_controls_cell:
+                                        bridge_cost = getattr(clicked_bridge, 'creation_cost',
+                                                              1)
 
-                        if self.show_context_menu:
-                            if self.menu_rect.collidepoint(mouse_pos):
-                                option_index = (mouse_pos[1] - self.menu_rect.y) // 30
-                                if option_index == 0:
-                                    logger.info(f"All connections are removed")
-                                    self.remove_all_bridges_from_cell(self.context_menu_cell)
+                                        self.remove_bridge(clicked_bridge)
 
-                            self.show_context_menu = False
-                            self.context_menu_cell = None
-                            continue
+                                        refund_cell.points += bridge_cost
 
-                    elif event.button == 3:  # Right click
-                        mouse_pos = pygame.mouse.get_pos()
-                        clicked_cell = self.get_cell_at_position(mouse_pos[0], mouse_pos[1])
-
-                        if clicked_cell:
-                            if (self.control_enemy and clicked_cell.cell_type == CellType.ENEMY) or \
-                                    (not self.control_enemy and clicked_cell.cell_type == CellType.PLAYER):
-                                self.show_context_menu = True
-                                self.context_menu_cell = clicked_cell
-                                logger.info(f"Context menu opened for cell at ({clicked_cell.x}, {clicked_cell.y})")
-            if self.turn_based_mode and self.turn_timer_active:
-                dt = self.clock.get_time() / 1000.0  # ms to s
-                self.turn_time_remaining -= dt
-
-                if self.turn_time_remaining <= 0 or self.move_made_this_turn:
-                    self.switch_turns()
-                elif event.type == pygame.MOUSEBUTTONDOWN:
-                    if event.button == 1:  # Left click
-                        mouse_pos = pygame.mouse.get_pos()
-                        clicked_cell = self.get_cell_at_position(mouse_pos[0], mouse_pos[1])
-
-                        if clicked_cell:
-                            if not creating_bridge:
-                                can_start_bridge = True
-
-                                if self.turn_based_mode:
-                                    is_player_cell = clicked_cell.cell_type == CellType.PLAYER
-                                    is_enemy_cell = clicked_cell.cell_type == CellType.ENEMY
-
-                                    if (is_player_cell and not self.current_player_turn) or \
-                                            (is_enemy_cell and self.current_player_turn):
-                                        can_start_bridge = False
-                                        logger.info("Not your turn to create a bridge")
-
-                                if can_start_bridge and (
-                                        (self.control_enemy and clicked_cell.cell_type == CellType.ENEMY) or \
-                                        (not self.control_enemy and clicked_cell.cell_type == CellType.PLAYER)):
-                                    creating_bridge = True
-                                    bridge_start_cell = clicked_cell
-                                    self.create_impact_effect(clicked_cell.x, clicked_cell.y,
-                                                              not self.control_enemy)
-                            else:
-                                if clicked_cell != bridge_start_cell:
-                                    if self.create_bridge(bridge_start_cell, clicked_cell):
-                                        self.create_impact_effect(clicked_cell.x, clicked_cell.y,
-                                                                  not self.control_enemy)
+                                        self.create_impact_effect(refund_cell.x, refund_cell.y,
+                                                                  refund_cell.cell_type == CellType.PLAYER)
+                                        logger.info(
+                                            f"Bridge removed. Refunded {bridge_cost} points to cell at ({refund_cell.x}, {refund_cell.y})")
 
                                         if self.turn_based_mode:
                                             self.move_made_this_turn = True
                                             self.switch_turns()
 
-                                creating_bridge = False
-                                bridge_start_cell = None
+                                        continue
+
+                for cell in self.cells:
+                    cell.update(current_time)
+                    if cell.cell_type != CellType.EMPTY:
+                        self.update_evolution_based_on_points(cell)
+
+                if self.ai_enabled:
+                    if self.ai_difficulty == "Easy":
+                        self.ai_move_cooldown = 1500
+                    elif self.ai_difficulty == "Medium":
+                        self.ai_move_cooldown = 1000
+                    else:  # Hard
+                        self.ai_move_cooldown = 500
+
+                    #self.ai.update(current_time)
+
+                    #if current_time % 20000 < 50:
+                     #   self.ai.adapt_strategy()
+
+                self.spawn_balls(current_time)
+
+                for bridge in self.bridges:
+                    bridge.update()
+
+                balls_to_remove = []
+                for ball in self.balls:
+                    ball.update()
+
+                    for other_ball in self.balls:
+                        if ball != other_ball and ball.check_collision(other_ball):
+                            if ball not in balls_to_remove:
+                                balls_to_remove.append(ball)
+                            if other_ball not in balls_to_remove:
+                                balls_to_remove.append(other_ball)
+
+                            self.create_collision_effect(ball.x, ball.y)
+
+                    target_cell = self.get_cell_at_position(ball.target_x, ball.target_y)
+                    if target_cell and ball.reached_target(target_cell):
+                        balls_to_remove.append(ball)
+
+                        self.create_impact_effect(target_cell.x, target_cell.y, ball.is_player)
+
+                        if target_cell.cell_type == CellType.EMPTY:
+                            captured = target_cell.try_capture(ball.attack_value, ball.is_player)
+                            if captured and ball.is_player:
+                                self.points += 50
+                        elif (target_cell.cell_type == CellType.PLAYER and ball.is_player) or \
+                                (target_cell.cell_type == CellType.ENEMY and not ball.is_player):
+                            target_cell.points += ball.attack_value
+                            if ball.is_player:
+                                self.points += 5
                         else:
-                            clicked_bridge, refund_to_source = self.get_bridge_at_position(mouse_pos[0], mouse_pos[1])
+                            damage = ball.attack_value
 
-                            if clicked_bridge:
-                                can_remove = True
+                            if not getattr(ball, 'is_support_ball', False):
+                                support_multiplier = self.get_support_bonus(ball.source_cell)
+                                damage = int(damage * support_multiplier)
 
-                                if self.turn_based_mode:
-                                    refund_cell = clicked_bridge.source_cell if refund_to_source else clicked_bridge.target_cell
-                                    is_player_bridge = refund_cell.cell_type == CellType.PLAYER
-                                    is_enemy_bridge = refund_cell.cell_type == CellType.ENEMY
-
-                                    if (is_player_bridge and not self.current_player_turn) or \
-                                            (is_enemy_bridge and self.current_player_turn):
-                                        can_remove = False
-                                        logger.info("Not your turn to remove this bridge")
-
-                                refund_cell = clicked_bridge.source_cell if refund_to_source else clicked_bridge.target_cell
-                                user_controls_cell = (self.control_enemy and refund_cell.cell_type == CellType.ENEMY) or \
-                                                     (
-                                                             not self.control_enemy and refund_cell.cell_type == CellType.PLAYER)
-
-                                if can_remove and user_controls_cell:
-                                    bridge_cost = getattr(clicked_bridge, 'creation_cost',
-                                                          1)
-
-                                    self.remove_bridge(clicked_bridge)
-
-                                    refund_cell.points += bridge_cost
-
-                                    self.create_impact_effect(refund_cell.x, refund_cell.y,
-                                                              refund_cell.cell_type == CellType.PLAYER)
-                                    logger.info(
-                                        f"Bridge removed. Refunded {bridge_cost} points to cell at ({refund_cell.x}, {refund_cell.y})")
-
-                                    if self.turn_based_mode:
-                                        self.move_made_this_turn = True
-                                        self.switch_turns()
-
-                                    continue
-
-            for cell in self.cells:
-                cell.update(current_time)
-                if cell.cell_type != CellType.EMPTY:
-                    self.update_evolution_based_on_points(cell)
-
-            if self.ai_enabled:
-                if self.ai_difficulty == "Easy":
-                    self.ai_move_cooldown = 1500
-                elif self.ai_difficulty == "Medium":
-                    self.ai_move_cooldown = 1000
-                else:  # Hard
-                    self.ai_move_cooldown = 500
-
-                #self.ai.update(current_time)
-
-                #if current_time % 20000 < 50:
-                 #   self.ai.adapt_strategy()
-
-            self.spawn_balls(current_time)
-
-            for bridge in self.bridges:
-                bridge.update()
-
-            balls_to_remove = []
-            for ball in self.balls:
-                ball.update()
-
-                for other_ball in self.balls:
-                    if ball != other_ball and ball.check_collision(other_ball):
-                        if ball not in balls_to_remove:
-                            balls_to_remove.append(ball)
-                        if other_ball not in balls_to_remove:
-                            balls_to_remove.append(other_ball)
-
-                        self.create_collision_effect(ball.x, ball.y)
-
-                target_cell = self.get_cell_at_position(ball.target_x, ball.target_y)
-                if target_cell and ball.reached_target(target_cell):
-                    balls_to_remove.append(ball)
-
-                    self.create_impact_effect(target_cell.x, target_cell.y, ball.is_player)
-
-                    if target_cell.cell_type == CellType.EMPTY:
-                        captured = target_cell.try_capture(ball.attack_value, ball.is_player)
-                        if captured and ball.is_player:
-                            self.points += 50
-                    elif (target_cell.cell_type == CellType.PLAYER and ball.is_player) or \
-                            (target_cell.cell_type == CellType.ENEMY and not ball.is_player):
-                        target_cell.points += ball.attack_value
-                        if ball.is_player:
-                            self.points += 5
-                    else:
-                        damage = ball.attack_value
-
-                        if not getattr(ball, 'is_support_ball', False):
-                            support_multiplier = self.get_support_bonus(ball.source_cell)
-                            damage = int(damage * support_multiplier)
-
-                        old_points = target_cell.points
-                        target_cell.points = max(0, target_cell.points - damage)
-                        points_reduced = old_points - target_cell.points
-
-                        if ball.is_player:
-                            self.points += points_reduced * 10
-
-                        if damage > ball.attack_value and ball.is_player:
-                            self.create_support_effect(target_cell.x, target_cell.y, ball.is_player)
-
-                        if target_cell.points == 0:
-                            self.remove_all_bridges_from_cell(target_cell)
-                            old_type = target_cell.cell_type
-                            target_cell.cell_type = CellType.PLAYER if ball.is_player else CellType.ENEMY
-                            target_cell.points = 10
+                            old_points = target_cell.points
+                            target_cell.points = max(0, target_cell.points - damage)
+                            points_reduced = old_points - target_cell.points
 
                             if ball.is_player:
-                                self.points += 100
+                                self.points += points_reduced * 10
 
-                            logger.info(
-                                f"Cell at ({target_cell.x}, {target_cell.y}) captured: {old_type} -> {target_cell.cell_type}")
+                            if damage > ball.attack_value and ball.is_player:
+                                self.create_support_effect(target_cell.x, target_cell.y, ball.is_player)
 
-                            for _ in range(5):
-                                self.create_impact_effect(target_cell.x, target_cell.y, ball.is_player)
-            for ball in balls_to_remove:
-                if ball in self.balls:
-                    self.balls.remove(ball)
+                            if target_cell.points == 0:
+                                self.remove_all_bridges_from_cell(target_cell)
+                                old_type = target_cell.cell_type
+                                target_cell.cell_type = CellType.PLAYER if ball.is_player else CellType.ENEMY
+                                target_cell.points = 10
 
-            self.screen.blit(background, (0, 0))
+                                if ball.is_player:
+                                    self.points += 100
 
-            for bridge in self.bridges:
-                bridge.draw(self.screen)
+                                logger.info(
+                                    f"Cell at ({target_cell.x}, {target_cell.y}) captured: {old_type} -> {target_cell.cell_type}")
 
-            if creating_bridge:
-                mouse_pos = pygame.mouse.get_pos()
-                pygame.draw.line(self.screen, (100, 100, 100),
-                                 (bridge_start_cell.x, bridge_start_cell.y),
-                                 mouse_pos, BRIDGE_WIDTH)
+                                for _ in range(5):
+                                    self.create_impact_effect(target_cell.x, target_cell.y, ball.is_player)
+                for ball in balls_to_remove:
+                    if ball in self.balls:
+                        self.balls.remove(ball)
 
-            for cell in self.cells:
-                cell.draw(self.screen, self)
+                self.screen.blit(background, (0, 0))
 
-            for ball in self.balls:
-                ball.draw(self.screen)
+                for bridge in self.bridges:
+                    bridge.draw(self.screen)
 
-            self.draw_game_info()
+                if creating_bridge:
+                    mouse_pos = pygame.mouse.get_pos()
+                    pygame.draw.line(self.screen, (100, 100, 100),
+                                     (bridge_start_cell.x, bridge_start_cell.y),
+                                     mouse_pos, BRIDGE_WIDTH)
 
-            if self.show_suggestions:
-                draw_suggestions(self, self.screen)
+                for cell in self.cells:
+                    cell.draw(self.screen, self)
 
-            self.draw_context_menu(self.screen)
+                for ball in self.balls:
+                    ball.draw(self.screen)
+
+                self.draw_game_info()
+
+                if self.show_suggestions:
+                    draw_suggestions(self, self.screen)
+
+                self.draw_context_menu(self.screen)
+                if self.check_win_condition():
+                    continue
             pygame.display.flip()
             self.clock.tick(FPS)
-            if self.check_win_condition():
-                continue
-
         pygame.quit()
         sys.exit()
 
@@ -1374,6 +1491,14 @@ class Game:
         if self.turn_based_mode and not self.move_made_this_turn:
             self.move_made_this_turn = True
             logger.info(f"{'Player' if not self.control_enemy else 'Enemy'} made a move")
+
+        if new_bridge and not self.playback_active:
+            self.game_recorder.record_event("BRIDGE_CREATED", {
+                "sourceId": self.game_recorder.cell_id_map.get(source_cell, -1),
+                "targetId": self.game_recorder.cell_id_map.get(target_cell, -1),
+                "direction": "TWO_WAY" if existing_bridge else "ONE_WAY",
+                "cost": bridge_cost
+            })
 
         return True
 
@@ -1471,6 +1596,222 @@ class Game:
         screen.blit(menu_surface, (menu_x, menu_y))
 
         self.menu_rect = pygame.Rect(menu_x, menu_y, menu_width, menu_height)
+
+    def show_replay_menu(self):
+        MENU_BG_COLOR = (20, 20, 40)
+        TITLE_COLOR = (220, 220, 255)
+
+        menu_running = True
+        clock = pygame.time.Clock()
+
+        json_files = []
+        xml_files = []
+
+        if os.path.exists("saved_games/json"):
+            json_files = sorted([f for f in os.listdir("saved_games/json") if f.endswith(".json")], reverse=True)
+
+        if os.path.exists("saved_games/xml"):
+            xml_files = sorted([f for f in os.listdir("saved_games/xml") if f.endswith(".xml")], reverse=True)
+
+        formats = ["JSON", "XML", "MongoDB"]
+        current_format = 0
+
+        mongodb_games = []
+        try:
+            mongodb_games = get_saved_games_from_mongodb(20)  #limit up to 20 games
+        except:
+            logger.error("Failed to fetch games from MongoDB")
+
+        scroll_offset = 0
+        max_items = 8
+        selected_index = 0
+
+        def get_active_list():
+            if formats[current_format] == "JSON":
+                return json_files
+            elif formats[current_format] == "XML":
+                return xml_files
+            elif formats[current_format] == "MongoDB":
+                return mongodb_games
+            else:
+                return []
+
+        while menu_running:
+            active_list = get_active_list()
+
+            for event in pygame.event.get():
+                if event.type == pygame.QUIT:
+                    pygame.quit()
+                    sys.exit()
+                elif event.type == pygame.KEYDOWN:
+                    if event.key == pygame.K_ESCAPE:
+                        return False
+                    elif event.key == pygame.K_UP:
+                        selected_index = max(0, selected_index - 1)
+                        if selected_index < scroll_offset:
+                            scroll_offset = selected_index
+                    elif event.key == pygame.K_DOWN:
+                        selected_index = min(len(active_list) - 1, selected_index + 1)
+                        if selected_index >= scroll_offset + max_items:
+                            scroll_offset = selected_index - max_items + 1
+                    elif event.key == pygame.K_LEFT:
+                        current_format = (current_format - 1) % len(formats)
+                        selected_index = 0
+                        scroll_offset = 0
+                    elif event.key == pygame.K_RIGHT:
+                        current_format = (current_format + 1) % len(formats)
+                        selected_index = 0
+                        scroll_offset = 0
+                    elif event.key == pygame.K_RETURN:
+                        if active_list and 0 <= selected_index < len(active_list):
+                            if formats[current_format] == "JSON":
+                                filename = f"saved_games/json/{active_list[selected_index]}"
+                                if self.start_playback(filename, "json"):
+                                    return True
+                            elif formats[current_format] == "XML":
+                                filename = f"saved_games/xml/{active_list[selected_index]}"
+                                if self.start_playback(filename, "xml"):
+                                    return True
+                            elif formats[current_format] == "MongoDB" and mongodb_games and 0 <= selected_index < len(
+                                    mongodb_games):
+                                game_id = str(mongodb_games[selected_index]["_id"])
+                                if self.start_playback(game_id, "mongodb"):
+                                    self.game_started = True
+                                    return True
+
+                    if formats[current_format] == "JSON":
+                        filename = f"saved_games/json/{active_list[selected_index]}"
+                        if self.start_playback(filename, "json"):
+                            return True
+                    elif formats[current_format] == "XML":
+                        filename = f"saved_games/xml/{active_list[selected_index]}"
+                        if self.start_playback(filename, "xml"):
+                            return True
+                    elif formats[current_format] == "MongoDB":
+                        if not active_list:
+                            no_files_font = pygame.font.SysFont('Arial', 20)
+                            no_files_text = "No MongoDB saved games found"
+                            no_files_surface = no_files_font.render(no_files_text, True, (180, 180, 180))
+                            no_files_rect = no_files_surface.get_rect(center=(SCREEN_WIDTH / 2, 200))
+                            self.screen.blit(no_files_surface, no_files_rect)
+                        else:
+                            item_font = pygame.font.SysFont('Arial', 18)
+                            for i in range(min(max_items, len(active_list) - scroll_offset)):
+                                idx = scroll_offset + i
+                                item = active_list[idx]
+
+                                try:
+                                    timestamp = item.get("timestamp", None)
+                                    if timestamp:
+                                        formatted_date = timestamp.strftime("%Y-%m-%d")
+                                        formatted_time = timestamp.strftime("%H:%M:%S")
+                                        display_text = f"{formatted_date} {formatted_time}"
+                                    else:
+                                        display_text = f"Game {idx + 1}"
+                                except:
+                                    display_text = f"Game {idx + 1}"
+                elif event.type == pygame.MOUSEBUTTONDOWN:
+                    if event.button == 1:  # Left click
+                        mouse_pos = pygame.mouse.get_pos()
+
+                        tab_width = SCREEN_WIDTH / len(formats)
+                        for i, fmt in enumerate(formats):
+                            tab_rect = pygame.Rect(tab_width * i, 0, tab_width, 50)
+                            if tab_rect.collidepoint(mouse_pos):
+                                current_format = i
+                                selected_index = 0
+                                scroll_offset = 0
+
+                        item_height = 50
+                        for i in range(min(max_items, len(active_list) - scroll_offset)):
+                            item_rect = pygame.Rect(100, 100 + i * item_height, SCREEN_WIDTH - 200, item_height)
+                            if item_rect.collidepoint(mouse_pos):
+                                selected_index = scroll_offset + i
+
+                                if formats[current_format] == "JSON":
+                                    filename = f"saved_games/json/{active_list[selected_index]}"
+                                    success = self.start_playback(filename, "json")
+                                    if success:
+                                        self.game_started = True
+                                        return True
+                                elif formats[current_format] == "XML":
+                                    filename = f"saved_games/xml/{active_list[selected_index]}"
+                                    success = self.start_playback(filename, "xml")
+                                    if success:
+                                        self.game_started = True
+                                        return True
+                    elif event.button == 4:  # Scroll up
+                        scroll_offset = max(0, scroll_offset - 1)
+                    elif event.button == 5:  # Scroll down
+                        scroll_offset = min(max(0, len(active_list) - max_items), scroll_offset + 1)
+
+            self.screen.fill(MENU_BG_COLOR)
+
+            title_font = pygame.font.SysFont('Arial', 36, bold=True)
+            title_text = "REPLAY SAVED GAMES"
+            title_surface = title_font.render(title_text, True, TITLE_COLOR)
+            title_rect = title_surface.get_rect(center=(SCREEN_WIDTH / 2, 30))
+            self.screen.blit(title_surface, title_rect)
+
+            tab_font = pygame.font.SysFont('Arial', 24, bold=True)
+            tab_width = SCREEN_WIDTH / len(formats)
+            for i, fmt in enumerate(formats):
+                tab_color = (80, 100, 180) if i == current_format else (50, 50, 70)
+                pygame.draw.rect(self.screen, tab_color, (tab_width * i, 60, tab_width, 40))
+                pygame.draw.rect(self.screen, (100, 100, 150), (tab_width * i, 60, tab_width, 40), 1)
+
+                fmt_surface = tab_font.render(fmt, True, (255, 255, 255))
+                fmt_rect = fmt_surface.get_rect(center=(tab_width * i + tab_width / 2, 80))
+                self.screen.blit(fmt_surface, fmt_rect)
+
+            if not active_list:
+                no_files_font = pygame.font.SysFont('Arial', 20)
+                no_files_text = f"No {formats[current_format]} replay files found"
+                no_files_surface = no_files_font.render(no_files_text, True, (180, 180, 180))
+                no_files_rect = no_files_surface.get_rect(center=(SCREEN_WIDTH / 2, 200))
+                self.screen.blit(no_files_surface, no_files_rect)
+            else:
+                item_font = pygame.font.SysFont('Arial', 18)
+                for i in range(min(max_items, len(active_list) - scroll_offset)):
+                    idx = scroll_offset + i
+                    item = active_list[idx]
+
+                    # extract date and time from filename
+                    # format: game_20240406_123456_789.json
+                    try:
+                        date_str = item.split("_")[1]
+                        time_str = item.split("_")[2]
+                        formatted_date = f"{date_str[:4]}-{date_str[4:6]}-{date_str[6:]}"
+                        formatted_time = f"{time_str[:2]}:{time_str[2:4]}:{time_str[4:]}"
+                        display_text = f"{formatted_date} {formatted_time}"
+                    except:
+                        display_text = item
+
+                    item_y = 120 + i * 50
+                    item_rect = pygame.Rect(100, item_y, SCREEN_WIDTH - 200, 40)
+
+                    highlight_color = (60, 100, 180) if idx == selected_index else (40, 40, 60)
+                    pygame.draw.rect(self.screen, highlight_color, item_rect)
+                    pygame.draw.rect(self.screen, (100, 100, 150), item_rect, 1)
+
+                    item_surface = item_font.render(display_text, True, (255, 255, 255))
+                    self.screen.blit(item_surface, (120, item_y + 12))
+
+            instructions_font = pygame.font.SysFont('Arial', 16)
+            instructions = [
+                "↑/↓: Navigate files   ←/→: Change format",
+                "ENTER: Load selected replay   ESC: Back to menu"
+            ]
+
+            for i, instruction in enumerate(instructions):
+                inst_surface = instructions_font.render(instruction, True, (180, 180, 180))
+                inst_rect = inst_surface.get_rect(center=(SCREEN_WIDTH / 2, SCREEN_HEIGHT - 50 + i * 20))
+                self.screen.blit(inst_surface, inst_rect)
+
+            pygame.display.flip()
+            clock.tick(30)
+
+        return False
 
     def remove_all_bridges_from_cell(self, cell):
         logger.info(f"Removing all bridges from cell at ({cell.x}, {cell.y})")
@@ -1706,6 +2047,26 @@ class Game:
                                 self.current_level = next_level
                                 self.start_game()
                                 waiting = False
+        if not self.playback_active:
+            result = "Player Wins" if "Blue Wins" in message else "Enemy Wins"
+            self.game_recorder.game_id = generate_game_id(self.current_level, completed=True)
+
+            self.game_recorder.stop_recording(result)
+
+            json_file = self.game_recorder.save_to_json()
+            xml_file = self.game_recorder.save_to_xml()
+            mongo_id = self.game_recorder.save_to_mongodb()
+
+            logger.info(f"Game history saved to JSON: {json_file}")
+            logger.info(f"Game history saved to XML: {xml_file}")
+            try:
+                mongodb_id = self.game_recorder.save_to_mongodb()
+                if mongodb_id:
+                    logger.info(f"Game history saved to MongoDB with ID: {mongodb_id}")
+            except Exception as e:
+                logger.error(f"Failed to save to MongoDB: {e}")
+            except ImportError:
+                pass
 
     def reset_game(self):
         self.cells = []
@@ -1718,6 +2079,513 @@ class Game:
 
         self.initialize_board()
         logger.info("Game reset")
+
+    def start_playback(self, filename, format_type="json"):
+        self.playback_active = True
+        self.game_playback = GamePlayback(
+            self,
+            cell_class=Cell,
+            cell_type_class=CellType,
+            cell_shape_class=CellShape,
+            evolution_level_class=EvolutionLevel
+        )
+
+        success = False
+        if format_type.lower() == "json":
+            success = self.game_playback.load_json_history(filename)
+        elif format_type.lower() == "xml":
+            success = self.game_playback.load_xml_history(filename)
+        elif format_type.lower() == "mongodb":
+            success = self.game_playback.load_mongodb_history(filename)
+
+        if success:
+            self.game_playback.start_playback()
+            self.playback_controls_visible = True
+            return True
+        else:
+            self.playback_active = False
+            self.game_playback = None
+            return False
+
+    def show_continue_dialog(self, saved_game):
+        dialog_bg = pygame.Surface((500, 200), pygame.SRCALPHA)
+        dialog_bg.fill((30, 30, 50, 220))
+
+        dialog_x = (SCREEN_WIDTH - 500) // 2
+        dialog_y = (SCREEN_HEIGHT - 200) // 2
+
+        font_title = pygame.font.SysFont('Arial', 24, bold=True)
+        font_text = pygame.font.SysFont('Arial', 18)
+
+        timestamp = saved_game["timestamp"].replace("_", " ")
+        points = saved_game["data"]["events"][-1]["data"].get("points", 0)
+        time_taken = saved_game["data"]["events"][-1]["data"].get("time_taken", 0)
+
+        title_surface = font_title.render("Continue Game", True, (255, 255, 255))
+        text1 = font_text.render(f"Found saved game from: {timestamp}", True, (220, 220, 220))
+        text2 = font_text.render(f"Points: {points}, Time: {format_time(time_taken)}", True, (220, 220, 220))
+        text3 = font_text.render("Do you want to continue this game?", True, (220, 220, 220))
+
+        continue_button = pygame.Rect(dialog_x + 80, dialog_y + 150, 150, 30)
+        new_game_button = pygame.Rect(dialog_x + 270, dialog_y + 150, 150, 30)
+
+        continue_text = font_text.render("Continue", True, (255, 255, 255))
+        new_game_text = font_text.render("New Game", True, (255, 255, 255))
+
+        screen_backup = self.screen.copy()
+
+        dialog_active = True
+        result = False
+
+        while dialog_active:
+            for event in pygame.event.get():
+                if event.type == pygame.QUIT:
+                    pygame.quit()
+                    sys.exit()
+                elif event.type == pygame.MOUSEBUTTONDOWN:
+                    mouse_pos = pygame.mouse.get_pos()
+                    if continue_button.collidepoint(mouse_pos):
+                        result = True
+                        dialog_active = False
+                    elif new_game_button.collidepoint(mouse_pos):
+                        result = False
+                        dialog_active = False
+
+            self.screen.blit(screen_backup, (0, 0))
+            self.screen.blit(dialog_bg, (dialog_x, dialog_y))
+
+            self.screen.blit(title_surface, (dialog_x + 250 - title_surface.get_width() // 2, dialog_y + 20))
+            self.screen.blit(text1, (dialog_x + 250 - text1.get_width() // 2, dialog_y + 60))
+            self.screen.blit(text2, (dialog_x + 250 - text2.get_width() // 2, dialog_y + 90))
+            self.screen.blit(text3, (dialog_x + 250 - text3.get_width() // 2, dialog_y + 120))
+
+            pygame.draw.rect(self.screen, (50, 150, 50), continue_button)
+            pygame.draw.rect(self.screen, (150, 50, 50), new_game_button)
+
+            self.screen.blit(continue_text, (continue_button.centerx - continue_text.get_width() // 2,
+                                             continue_button.centery - continue_text.get_height() // 2))
+            self.screen.blit(new_game_text, (new_game_button.centerx - new_game_text.get_width() // 2,
+                                             new_game_button.centery - new_game_text.get_height() // 2))
+
+            pygame.display.flip()
+
+        return result
+
+    def draw_playback_controls(self):
+        if not self.game_playback:
+            return
+
+        control_height = 40
+        control_bg = pygame.Surface((SCREEN_WIDTH, control_height), pygame.SRCALPHA)
+        control_bg.fill((0, 0, 0, 180))
+        self.screen.blit(control_bg, (0, SCREEN_HEIGHT - control_height))
+
+        font = pygame.font.SysFont('Arial', 16)
+
+        status_text = "⏸ PAUSED" if not self.game_playback.is_playing else "▶ PLAYING"
+        status_surface = font.render(status_text, True, WHITE)
+        self.screen.blit(status_surface, (20, SCREEN_HEIGHT - control_height + 10))
+
+        speed_text = f"{self.game_playback.playback_speed:.2f}x"
+        speed_surface = font.render(speed_text, True, WHITE)
+        self.screen.blit(speed_surface, (150, SCREEN_HEIGHT - control_height + 10))
+
+        if self.game_playback.history and len(self.game_playback.history["events"]) > 0:
+            total_duration = self.game_playback.history["metadata"].get("duration", 0)
+            progress = min(1.0, self.game_playback.current_time / total_duration) if total_duration > 0 else 0
+
+            pygame.draw.rect(self.screen, (80, 80, 80),
+                             (200, SCREEN_HEIGHT - control_height + 15, 400, 10))
+
+            pygame.draw.rect(self.screen, (200, 200, 255),
+                             (200, SCREEN_HEIGHT - control_height + 15, int(400 * progress), 10))
+
+        help_text = "SPACE: Play/Pause | ←→: Speed | ESC: Exit"
+        help_surface = font.render(help_text, True, (200, 200, 200))
+        self.screen.blit(help_surface, (SCREEN_WIDTH - 280, SCREEN_HEIGHT - control_height + 10))
+
+    def save_to_mongodb(self, connection_string=None):
+        try:
+            import pymongo
+            MONGODB_AVAILABLE = True
+        except ImportError:
+            print("MongoDB support not available. Install pymongo package with 'pip install pymongo'")
+            return None
+
+        if not self.events:
+            return None
+
+        try:
+            conn_str = connection_string or "mongodb://localhost:27017/"
+            client = pymongo.MongoClient(conn_str, serverSelectionTimeoutMS=5000)  # 5 second timeout
+
+            client.server_info()
+
+            db = client["war_of_cells"]
+            collection = db["game_history"]
+
+            game_history = {
+                "metadata": self.metadata,
+                "events": self.events
+            }
+
+            result = collection.insert_one(game_history)
+            print(f"Game history saved to MongoDB with ID: {result.inserted_id}")
+            return str(result.inserted_id)
+
+        except pymongo.errors.ServerSelectionTimeoutError:
+            print("Could not connect to MongoDB server. Is it running?")
+            return None
+        except Exception as e:
+            print(f"MongoDB error: {e}")
+            return None
+
+    def load_saved_game(self, saved_game):
+        save_events = [event for event in saved_game["data"]["events"] if event["eventType"] == "GAME_SAVE"]
+        if not save_events:
+            return False
+
+        save_data = save_events[-1]["data"]
+
+        self.cells = []
+        self.bridges = []
+        self.balls = []
+        self.effects = []
+        self.selected_cell = None
+        self.last_ball_spawn_time = {}
+
+        cell_id_map = {}
+        for cell_data in save_data["cells"]:
+            cell_type = getattr(CellType, cell_data["type"])
+            shape = getattr(CellShape, cell_data["shape"])
+            evolution = EvolutionLevel(cell_data["evolution"])
+
+            new_cell = Cell(cell_data["x"], cell_data["y"], cell_type, shape, evolution)
+            new_cell.points = cell_data["points"]
+            new_cell.points_to_capture = cell_data["points_to_capture"]
+            new_cell.enemy_points_to_capture = cell_data["enemy_points_to_capture"]
+
+            self.cells.append(new_cell)
+            cell_id_map[cell_data["id"]] = new_cell
+
+        for bridge_data in save_data.get("bridges", []):
+            source_cell = cell_id_map.get(bridge_data["source_cell_id"])
+            target_cell = cell_id_map.get(bridge_data["target_cell_id"])
+
+            if source_cell and target_cell:
+                new_bridge = Bridge(source_cell, target_cell)
+                new_bridge.direction = getattr(BridgeDirection, bridge_data["direction"])
+                new_bridge.has_reverse = bridge_data["has_reverse"]
+                new_bridge.creation_cost = bridge_data.get("creation_cost", 1)
+
+                self.bridges.append(new_bridge)
+                source_cell.outgoing_bridges.append(new_bridge)
+                target_cell.incoming_bridges.append(new_bridge)
+
+        for ball_data in save_data.get("balls", []):
+            source_cell = cell_id_map.get(ball_data["source_cell_id"])
+            if source_cell:
+                target_cell = min(self.cells,
+                                  key=lambda c: (
+                                              (c.x - ball_data["target_x"]) ** 2 + (c.y - ball_data["target_y"]) ** 2))
+
+                new_ball = Ball(source_cell, target_cell, ball_data["is_player"])
+                new_ball.x = ball_data["x"]
+                new_ball.y = ball_data["y"]
+                new_ball.is_support_ball = ball_data.get("is_support_ball", False)
+                new_ball.attack_value = ball_data["attack_value"]
+
+                self.balls.append(new_ball)
+
+        self.turn_based_mode = save_data.get("turn_based_mode", False)
+        self.current_player_turn = save_data.get("current_player_turn", True)
+        self.control_enemy = save_data.get("control_enemy", False)
+        self.points = save_data.get("points", 0)
+        self.time_taken = save_data.get("time_taken", 0)
+        self.start_time = pygame.time.get_ticks() / 1000 - self.time_taken
+
+        return True
+
+    def show_save_dialog(self):
+        dialog_bg = pygame.Surface((400, 150), pygame.SRCALPHA)
+        dialog_bg.fill((30, 30, 50, 220))
+
+        dialog_x = (SCREEN_WIDTH - 400) // 2
+        dialog_y = (SCREEN_HEIGHT - 150) // 2
+
+        font_title = pygame.font.SysFont('Arial', 24, bold=True)
+        font_text = pygame.font.SysFont('Arial', 18)
+
+        title_surface = font_title.render("Save Game", True, (255, 255, 255))
+        text_surface = font_text.render("Do you want to save your current progress?", True, (220, 220, 220))
+
+        yes_button = pygame.Rect(dialog_x + 80, dialog_y + 100, 100, 30)
+        no_button = pygame.Rect(dialog_x + 220, dialog_y + 100, 100, 30)
+
+        yes_text = font_text.render("Yes", True, (255, 255, 255))
+        no_text = font_text.render("No", True, (255, 255, 255))
+
+        screen_backup = self.screen.copy()
+
+        dialog_active = True
+        result = False
+
+        while dialog_active:
+            for event in pygame.event.get():
+                if event.type == pygame.QUIT:
+                    pygame.quit()
+                    sys.exit()
+                elif event.type == pygame.MOUSEBUTTONDOWN:
+                    mouse_pos = pygame.mouse.get_pos()
+                    if yes_button.collidepoint(mouse_pos):
+                        result = True
+                        dialog_active = False
+                    elif no_button.collidepoint(mouse_pos):
+                        result = False
+                        dialog_active = False
+
+            self.screen.blit(screen_backup, (0, 0))
+            self.screen.blit(dialog_bg, (dialog_x, dialog_y))
+
+            self.screen.blit(title_surface, (dialog_x + 200 - title_surface.get_width() // 2, dialog_y + 20))
+            self.screen.blit(text_surface, (dialog_x + 200 - text_surface.get_width() // 2, dialog_y + 60))
+
+            pygame.draw.rect(self.screen, (50, 100, 200), yes_button)
+            pygame.draw.rect(self.screen, (200, 50, 50), no_button)
+
+            self.screen.blit(yes_text, (yes_button.centerx - yes_text.get_width() // 2,
+                                        yes_button.centery - yes_text.get_height() // 2))
+            self.screen.blit(no_text, (no_button.centerx - no_text.get_width() // 2,
+                                       no_button.centery - no_text.get_height() // 2))
+
+            pygame.display.flip()
+
+        return result
+
+    def show_save_confirmation(self):
+        font = pygame.font.SysFont('Arial', 20)
+        text_surface = font.render("Game saved successfully!", True, (100, 255, 100))
+
+        bg_width = text_surface.get_width() + 40
+        bg_height = 50
+        bg_x = (SCREEN_WIDTH - bg_width) // 2
+        bg_y = 100
+
+        bg = pygame.Surface((bg_width, bg_height), pygame.SRCALPHA)
+        bg.fill((30, 30, 50, 220))
+
+        self.screen.blit(bg, (bg_x, bg_y))
+        self.screen.blit(text_surface, (bg_x + 20, bg_y + 15))
+        pygame.display.flip()
+
+        pygame.time.wait(2000)
+
+    def save_game_progress(self):
+        save_confirmed = self.show_save_dialog()
+        if not save_confirmed:
+            return
+
+        original_running_state = self.running
+        self.running = False
+
+        game_id = generate_game_id(self.current_level, completed=False)
+        self.game_recorder.game_id = game_id
+
+        self.game_recorder.record_event("GAME_SAVE", {
+            "level": self.current_level,
+            "time_taken": self.time_taken,
+            "points": self.points,
+            "cells": [self._serialize_cell(cell) for cell in self.cells],
+            "bridges": [self._serialize_bridge(bridge) for bridge in self.bridges],
+            "balls": [self._serialize_ball(ball) for ball in self.balls],
+            "turn_based_mode": self.turn_based_mode,
+            "current_player_turn": self.current_player_turn,
+            "control_enemy": self.control_enemy
+        })
+
+        json_file = self.game_recorder.save_to_json()
+        xml_file = self.game_recorder.save_to_xml()
+
+        try:
+            mongodb_id = self.game_recorder.save_to_mongodb()
+            if mongodb_id:
+                logger.info(f"Game history saved to MongoDB with ID: {mongodb_id}")
+        except Exception as e:
+            logger.error(f"Failed to save to MongoDB: {e}")
+
+        self.show_save_confirmation()
+
+        self.game_started = False
+        logger.info("Game saved successfully. Returning to menu.")
+
+
+    def _serialize_cell(self, cell):
+        return {
+            "id": id(cell),
+            "x": cell.x,
+            "y": cell.y,
+            "type": cell.cell_type.name,
+            "shape": cell.shape.name,
+            "evolution": cell.evolution.value,
+            "points": cell.points,
+            "points_to_capture": cell.points_to_capture,
+            "enemy_points_to_capture": cell.enemy_points_to_capture
+        }
+
+    def _serialize_bridge(self, bridge):
+        return {
+            "source_cell_id": id(bridge.source_cell),
+            "target_cell_id": id(bridge.target_cell),
+            "direction": bridge.direction.name,
+            "has_reverse": bridge.has_reverse,
+            "creation_cost": getattr(bridge, 'creation_cost', 1)
+        }
+
+    def _serialize_ball(self, ball):
+        return {
+            "source_cell_id": id(ball.source_cell),
+            "source_x": ball.source_x,
+            "source_y": ball.source_y,
+            "target_x": ball.target_x,
+            "target_y": ball.target_y,
+            "x": ball.x,
+            "y": ball.y,
+            "is_player": ball.is_player,
+            "is_support_ball": getattr(ball, 'is_support_ball', False),
+            "attack_value": ball.attack_value
+        }
+
+
+def check_saved_games_for_level(level_name):
+    saved_games = []
+
+    if os.path.exists("saved_games/json"):
+        json_files = [f for f in os.listdir("saved_games/json") if
+                      f.startswith(f"{level_name}_") and f.endswith(".json")]
+        for file in json_files:
+            if "in_progress" in file:
+                try:
+                    with open(os.path.join("saved_games/json", file), "r") as f:
+                        data = json.load(f)
+                        timestamp = file.split("_")[1] + "_" + file.split("_")[2]
+                        saved_games.append({
+                            "file": file,
+                            "format": "json",
+                            "timestamp": timestamp,
+                            "data": data
+                        })
+                except Exception as e:
+                    logger.error(f"Error loading JSON save file {file}: {e}")
+
+    if os.path.exists("saved_games/xml"):
+        try:
+            import xml.etree.ElementTree as ET
+            xml_files = [f for f in os.listdir("saved_games/xml") if
+                         f.startswith(f"{level_name}_") and f.endswith(".xml")]
+            for file in xml_files:
+                if "in_progress" in file:
+                    try:
+                        tree = ET.parse(os.path.join("saved_games/xml", file))
+                        root = tree.getroot()
+
+                        data = {"metadata": {}, "events": []}
+
+                        metadata_elem = root.find("Metadata")
+                        if metadata_elem:
+                            for child in metadata_elem:
+                                data["metadata"][child.tag] = child.text
+
+                        events_elem = root.find("Events")
+                        if events_elem:
+                            for event_elem in events_elem.findall("Event"):
+                                event = {
+                                    "timestamp": float(event_elem.get("timestamp")),
+                                    "eventType": event_elem.get("type"),
+                                    "data": {}
+                                }
+
+                                for child in event_elem:
+                                    if len(child) > 0:
+                                        items = []
+                                        for item_elem in child:
+                                            if len(item_elem) > 0:
+                                                item_dict = {}
+                                                for attr in item_elem:
+                                                    if attr.tag in ["id", "x", "y", "evolution", "points",
+                                                                    "points_to_capture", "enemy_points_to_capture"]:
+                                                        try:
+                                                            item_dict[attr.tag] = int(attr.text)
+                                                        except:
+                                                            item_dict[attr.tag] = attr.text
+                                                    else:
+                                                        item_dict[attr.tag] = attr.text
+                                                items.append(item_dict)
+                                            else:
+                                                items.append(item_elem.text)
+                                        event["data"][child.tag] = items
+                                    else:
+                                        if child.tag in ["points", "time_taken"]:
+                                            try:
+                                                event["data"][child.tag] = float(child.text)
+                                            except:
+                                                event["data"][child.tag] = child.text
+                                        elif child.tag in ["turn_based_mode", "current_player_turn",
+                                                           "control_enemy"]:
+                                            event["data"][child.tag] = child.text.lower() == "true"
+                                        else:
+                                            event["data"][child.tag] = child.text
+
+                                data["events"].append(event)
+
+                        timestamp = file.split("_")[1] + "_" + file.split("_")[2]
+                        saved_games.append({
+                            "file": file,
+                            "format": "xml",
+                            "timestamp": timestamp,
+                            "data": data
+                        })
+                    except Exception as e:
+                        logger.error(f"Error loading XML save file {file}: {e}")
+        except ImportError:
+            logger.error("XML parsing not available")
+
+    try:
+        import pymongo
+        from mongodb_config import DEFAULT_CONNECTION_STRING, DATABASE_NAME, COLLECTION_NAME
+
+        client = pymongo.MongoClient(DEFAULT_CONNECTION_STRING, serverSelectionTimeoutMS=2000)
+        db = client[DATABASE_NAME]
+        collection = db[COLLECTION_NAME]
+
+        query = {
+            "metadata.gameId": {"$regex": f"^{level_name}_.*_in_progress$"}
+        }
+
+        mongo_saves = list(collection.find(query).sort("metadata.timestamp", pymongo.DESCENDING))
+
+        for save in mongo_saves:
+            save["_id"] = str(save["_id"])
+
+            game_id = save["metadata"].get("gameId", "")
+            parts = game_id.split("_")
+            if len(parts) >= 3:
+                timestamp = parts[1] + "_" + parts[2]
+            else:
+                timestamp = datetime.datetime.now().strftime('%Y%m%d_%H%M%S')
+
+            saved_games.append({
+                "file": str(save["_id"]),
+                "format": "mongodb",
+                "timestamp": timestamp,
+                "data": save
+            })
+    except Exception as e:
+        logger.error(f"Error checking MongoDB saves: {e}")
+
+    saved_games.sort(key=lambda x: x["timestamp"], reverse=True)
+
+    return saved_games if saved_games else None
+
 
 def load_game_data(file_path):
     try:
@@ -1740,6 +2608,8 @@ def create_menu(game):
     STAR_SIZE = 25
     LEVELS_PER_ROW = 3
     SPACING = 30
+    BUTTON_WIDTH = 160
+    BUTTON_HEIGHT = 40
 
     menu_running = True
     clock = pygame.time.Clock()
@@ -1761,6 +2631,19 @@ def create_menu(game):
     pygame.draw.rect(lock_img, (150, 150, 150), (10, 10, 30, 15))
     pygame.draw.circle(lock_img, (100, 100, 100), (25, 20), 8)
 
+    editor_font = pygame.font.SysFont('Arial', 22, bold=True)
+    editor_text = "Level Editor"
+    editor_surface = editor_font.render(editor_text, True, (255, 255, 255))
+
+    replay_font = pygame.font.SysFont('Arial', 22, bold=True)
+    replay_text = "View Replays"
+    replay_surface = replay_font.render(replay_text, True, (255, 255, 255))
+
+    editor_rect = pygame.Rect(SCREEN_WIDTH / 2 - BUTTON_WIDTH - 10, 100, BUTTON_WIDTH, BUTTON_HEIGHT)
+    replay_rect = pygame.Rect(SCREEN_WIDTH / 2 + 10, 100, BUTTON_WIDTH, BUTTON_HEIGHT)
+
+    START_Y_LEVELS = 170
+
     while menu_running:
         for event in pygame.event.get():
             if event.type == pygame.QUIT:
@@ -1773,13 +2656,17 @@ def create_menu(game):
                 if event.button == 1:
                     mouse_pos = pygame.mouse.get_pos()
 
-                    if editor_rect.inflate(20, 10).collidepoint(mouse_pos):
+                    if editor_rect.collidepoint(mouse_pos):
                         editor = LevelEditor(game)
                         editor.run()
                         pygame.event.clear()
                         game.game_data = load_game_data("game_data.json")
+                    elif replay_rect.collidepoint(mouse_pos):
+                        if game.show_replay_menu():
+                            return True
+                        pygame.event.clear()
                     else:
-                        level_clicked = check_level_click(mouse_pos, game.game_data)
+                        level_clicked = check_level_click(mouse_pos, game.game_data, START_Y_LEVELS)
                         if level_clicked:
                             if is_level_unlocked(game.game_data, level_clicked):
                                 game.current_level = level_clicked
@@ -1793,16 +2680,17 @@ def create_menu(game):
         title_rect = title_surface.get_rect(center=(SCREEN_WIDTH / 2, 50))
         game.screen.blit(title_surface, title_rect)
 
-        editor_font = pygame.font.SysFont('Arial', 28, bold=True)
-        editor_text = "Open Level Editor"
-        editor_surface = editor_font.render(editor_text, True, (255, 255, 255))
-        editor_rect = editor_surface.get_rect(center=(SCREEN_WIDTH / 2, 100))
-        pygame.draw.rect(game.screen, (100, 100, 200), editor_rect.inflate(20, 10))
-        game.screen.blit(editor_surface, editor_rect)
+        pygame.draw.rect(game.screen, (100, 100, 200), editor_rect)
+        text_rect = editor_surface.get_rect(center=editor_rect.center)
+        game.screen.blit(editor_surface, text_rect)
+
+        pygame.draw.rect(game.screen, (100, 150, 100), replay_rect)
+        text_rect = replay_surface.get_rect(center=replay_rect.center)
+        game.screen.blit(replay_surface, text_rect)
 
         level_count = len(game.game_data.get("levels", {}))
         start_x = (SCREEN_WIDTH - (LEVELS_PER_ROW * LEVEL_WIDTH + (LEVELS_PER_ROW - 1) * SPACING)) / 2
-        start_y = 120
+        start_y = START_Y_LEVELS
 
         font = pygame.font.SysFont('Arial', 22, bold=True)
         small_font = pygame.font.SysFont('Arial', 14)
@@ -1861,7 +2749,7 @@ def create_menu(game):
     return False
 
 
-def check_level_click(mouse_pos, game_data):
+def check_level_click(mouse_pos, game_data, start_y=170):
     LEVEL_WIDTH = 150
     LEVEL_HEIGHT = 180
     LEVELS_PER_ROW = 3
@@ -1869,7 +2757,6 @@ def check_level_click(mouse_pos, game_data):
 
     level_count = len(game_data.get("levels", {}))
     start_x = (SCREEN_WIDTH - (LEVELS_PER_ROW * LEVEL_WIDTH + (LEVELS_PER_ROW - 1) * SPACING)) / 2
-    start_y = 120
 
     for i, level_name in enumerate(sorted(game_data.get("levels", {}).keys())):
         row = i // LEVELS_PER_ROW
@@ -2121,8 +3008,8 @@ def suggest_moves(game, for_player=True):
 
     return suggestions[:3]
 
+
 def can_create_more_bridges(game, cell):
-    """Check if cell can create more bridges"""
     return game.count_outgoing_bridges(cell) < cell.evolution.value
 
 
@@ -2235,6 +3122,45 @@ def draw_suggestions(game, screen):
             circle_surf.blit(text_surf, text_rect)
 
             screen.blit(circle_surf, (mid_x - circle_radius, mid_y - size - circle_radius * 2))
+
+
+def get_saved_games_from_mongodb(limit=20):
+    try:
+        import pymongo
+        from mongodb_config import DEFAULT_CONNECTION_STRING, DATABASE_NAME, COLLECTION_NAME
+    except ImportError:
+        logger.error("MongoDB support not available. Install pymongo package.")
+        return []
+
+    try:
+        client = pymongo.MongoClient(DEFAULT_CONNECTION_STRING, serverSelectionTimeoutMS=2000)
+        db = client[DATABASE_NAME]
+        collection = db[COLLECTION_NAME]
+
+        games = list(collection.find({},
+                                     {"metadata": 1, "timestamp": 1})
+                     .sort("timestamp", pymongo.DESCENDING)
+                     .limit(limit))
+
+        return games
+    except Exception as e:
+        logger.error(f"Error fetching games from MongoDB: {e}")
+        return []
+
+
+def safe_mongodb_operation(func):
+    def wrapper(*args, **kwargs):
+        try:
+            return func(*args, **kwargs)
+        except Exception as e:
+            logger.error(f"MongoDB operation failed: {e}")
+            return None if not kwargs.get('default') else kwargs.get('default')
+    return wrapper
+
+
+def send_action():
+
+    pass
 
 if __name__ == "__main__":
     game = Game()
