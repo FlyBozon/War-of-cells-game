@@ -1,4 +1,6 @@
 # War of Cells Game – Documentation
+![alt text](gif_game_ui/first_level_and_pseudo_ai_enemy.gif)
+
 ## Features
 
 ### Game Scene
@@ -112,8 +114,13 @@ _Where `u` = user, `e` = enemy, `o` = open cells_
 ### AI Suggestions
 - Pressing "H" in the terminal provides suggestions for the best possible moves (if any are available). Try modifying or removing connections if suggestions don't appear.
 
+![alt text](gif_game_ui/move_suggestions.gif)
+
+![alt text](gif_game_ui/move_suggestions_2.gif)
+
+
 ### Logger
-- Displays logs both in the terminal and GUI (`QTextEdit`).
+- Displays logs both in the terminal.
 - Rotating log system informs players about game state and actions.
 
 ---
@@ -155,6 +162,8 @@ A mode selection feature was added, allowing the player to choose between:
 - Single Player
 - Local Multiplayer
 - Online Multiplayer
+
+![choose game type](gif_game_ui/choose_game_type.gif)
 
 Permissions and functionality are managed based on the selected mode:
 
