@@ -1,16 +1,16 @@
 {
     "summary": {
-        "total_levels": 5,
+        "total_levels": 6,
         "levels": {
             "level1": {
                 "stars": 1,
-                "time": "00:55",
-                "score": 695
+                "time": "00:57",
+                "score": 620
             },
             "level2": {
-                "stars": 2,
-                "time": "01:01",
-                "score": 1400
+                "stars": 1,
+                "time": "00:46",
+                "score": 700
             },
             "level3": {
                 "stars": 2,
@@ -23,9 +23,14 @@
                 "score": 505
             },
             "level5": {
-                "stars": 0,
-                "time": "00:00",
-                "score": 0
+                "stars": 3,
+                "time": "01:34",
+                "score": 1870
+            },
+            "level6": {
+                "stars": 1,
+                "time": "00:04",
+                "score": 160
             }
         }
     },
@@ -336,6 +341,63 @@
                         "color": "no"
                     }
                 ]
+            }
+        },
+        "level6": {
+            "map": [
+                "##########",
+                "#        #",
+                "#        #",
+                "#  u u   #",
+                "#        #",
+                "# u e u  #",
+                "#        #",
+                "#    u   #",
+                "#        #",
+                "##########"
+            ],
+            "description": {
+                "e": [
+                    {
+                        "points": 5,
+                        "evolution": 1,
+                        "kind": "c",
+                        "color": "red"
+                    }
+                ],
+                "u": [
+                    {
+                        "points": 10,
+                        "evolution": 1,
+                        "kind": "c",
+                        "color": "blue"
+                    },
+                    {
+                        "points": 20,
+                        "evolution": 2,
+                        "kind": "c",
+                        "color": "blue"
+                    },
+                    {
+                        "points": 20,
+                        "evolution": 2,
+                        "kind": "c",
+                        "color": "blue"
+                    },
+                    {
+                        "points": 20,
+                        "evolution": 2,
+                        "kind": "c",
+                        "color": "blue"
+                    },
+                    {
+                        "points": 20,
+                        "evolution": 2,
+                        "kind": "c",
+                        "color": "blue"
+                    }
+                ],
+                "o": []
             }
         }
     }

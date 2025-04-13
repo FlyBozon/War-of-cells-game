@@ -1,0 +1,3 @@
+- correct json structure, remove evolution from there, as it is defined by number of points in the game, so dont need to be added at the beginning
+- change the structure of how the game is saved - must be saved only brigdes creation and changing cells side. Maybe later would also add some additional features, but for now thats the only 2 things that defines how the game looks like
+- remove opportunity to user to cancel enemy's bridges

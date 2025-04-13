@@ -11,8 +11,8 @@ from level_editor import *
 from initial_menu_window import *
 from game_recorder import *
 from game_playback import *
-from client import *
-from server import *
+#from client import *
+#from server import *
 
 pygame.init()
 
@@ -30,6 +30,7 @@ BACKGROUND_COLOR = (10, 10, 20)
 
 CELL_RADIUS = 30
 POINT_GROWTH_INTERVAL = 3000  # ms
+POINT_GROWTH_INTERVAL_new = POINT_GROWTH_INTERVAL
 BALL_SPEED = 2
 BALL_RADIUS = 5
 BRIDGE_WIDTH = 3
@@ -62,6 +63,7 @@ class EvolutionLevel(Enum):
 class BridgeDirection(Enum):
     ONE_WAY = 0
     TWO_WAY = 1
+
 
 class AIStrategy(Enum):
     AGGRESSIVE = 0  # focus on attacking enemy cells
@@ -127,7 +129,7 @@ class Cell:
 
     def update(self, current_time):
         if self.cell_type != CellType.EMPTY:
-            if current_time - self.last_growth_time >= POINT_GROWTH_INTERVAL:
+            if current_time - self.last_growth_time >= POINT_GROWTH_INTERVAL_new:
                 self.points += 1
                 self.last_growth_time = current_time
 
@@ -347,7 +349,7 @@ class Cell:
             game = self.game
             if not game.playback_active:
                 game.game_recorder.record_event("CELL_CAPTURED", {
-                    "cellId": game.game_recorder.cell_id_map.get(self, -1),
+                    "cellId": game.game_recorder.cell_id_map.get(Cell, -1),
                     "newType": self.cell_type.name,
                     "points": self.points,
                     "isPlayer": is_player
@@ -659,6 +661,18 @@ class Game:
         self.playback_active = False
         self.playback_controls_visible = False
 
+
+        #user's move and enemy's move - depending on who is playing (like rx/tx connections - what is rx for another is tx)
+        self.my_move = None
+        self.enemy_move = None
+
+        self.cell_id_map_reverse = {}  # Used for network event handling
+
+        self.game_speed = 1
+
+
+
+
         self.game_data = load_game_data("game_data.json")
         self.show_first_menu()
 
@@ -682,8 +696,9 @@ class Game:
                 self.turn_based_mode = True
             elif self.game_type == GameType.ONLINE:
                 self.ai_enabled = False
-                self.network_config["ip"] = menu.config["ip"]
-                self.network_config["port"] = menu.config["port"]
+                self.network_config["ip"] = menu.config.get("ip", "localhost")
+                self.network_config["port"] = int(menu.config.get("port", 5555))
+                logger.info(f"Network configuration: {self.network_config}")
 
             logger.info(f"Selected game mode: {self.game_type.to_string()}")
 
@@ -706,6 +721,37 @@ class Game:
                     self.game_over_state = False
                     logger.info(f"Continuing saved game for level: {self.current_level}")
                     return
+        
+        # Initialize networking BEFORE loading level if online mode
+        if self.game_type == GameType.ONLINE:
+            logger.info("Initializing network connection...")
+            
+            # First make sure the GameNetworkClient class is imported
+            if not hasattr(self, 'network_client') or self.network_client is None:
+                try:
+                    self.network_client = GameNetworkClient(self)
+                    logger.info("Network client created")
+                except Exception as e:
+                    logger.error(f"Failed to create network client: {e}")
+                    self.game_type = GameType.LOCAL_MULTI  # Fallback
+            
+            # Then attempt connection
+            try:
+                success = self.network_client.connect(
+                    self.network_config["ip"],
+                    self.network_config["port"]
+                )
+                
+                if success:
+                    logger.info("Successfully connected to game server")
+                else:
+                    logger.error("Failed to connect to game server - falling back to local mode")
+                    self.game_type = GameType.LOCAL_MULTI
+            except Exception as e:
+                logger.error(f"Error during connection: {e}")
+                self.game_type = GameType.LOCAL_MULTI
+        
+        # Now load the level
         load_level(self, self.current_level)
 
         self.game_started = True
@@ -715,9 +761,6 @@ class Game:
         self.start_time = pygame.time.get_ticks() / 1000  # start time, seconds
 
         logger.info(f"Starting game with level: {self.current_level}")
-
-        if self.game_type == GameType.ONLINE:
-            logger.info(f"Connecting to {self.network_config['ip']}:{self.network_config['port']}")
 
         if not self.playback_active:
             self.game_recorder.start_recording()
@@ -886,13 +929,14 @@ class Game:
                 self.create_impact_effect(cell.x, cell.y, True)
             else:
                 self.create_impact_effect(cell.x, cell.y, False)
-
+        """        
+        #dont want to record evolution changes, as they dont have too much sense, as they have constant logic, and when replaying the game would be done automatically
         if new_evolution.value != old_evolution and not self.playback_active:
             self.game_recorder.record_event("CELL_EVOLVED", {
                 "cellId": self.game_recorder.cell_id_map.get(cell, -1),
                 "oldLevel": old_evolution,
                 "newLevel": new_evolution.value
-            })
+            }) """
 
     def next_level(self):
         if not self.game_data:
@@ -1057,12 +1101,36 @@ class Game:
 
         background = self.draw_background_gradient()
 
+        #recalculate all speeds and frequences of balls sending and cell points updating
+        #params - game speed for playback
+        #dont forget about all rotation speeds
+
+        if self.playback_active and self.game_playback:
+            self.turn_time_remaining = self.turn_time_remaining/self.game_playback.playback_speed
+            Ball.speed = BALL_SPEED*self.game_playback.playback_speed
+            POINT_GROWTH_INTERVAL_new = POINT_GROWTH_INTERVAL/self.game_playback.playback_speed
+
+        playback_events = [] 
+        network_events = [] 
+
         while running:
+            # Make sure to call tick at beginning so event handling works properly
+            self.clock.tick(FPS)
+
+            playback_events = [] 
+            network_events = []  
+            
             if not self.game_started:
                 self.show_menu()
                 continue
-
-            if self.playback_active and self.game_playback:
+            if self.game_type == GameType.ONLINE:
+                # Get network events
+                network_events = self.get_network_events()
+            for event in playback_events + network_events:
+                self.apply_event(event)
+                
+            #want to create the same logic for playback and online game, so lets remove that playback part, and integrate it in the main game code
+            """if self.playback_active and self.game_playback:
                 self.game_playback.update()
 
                 self.screen.blit(background, (0, 0))
@@ -1078,360 +1146,457 @@ class Game:
 
                 self.draw_playback_controls()
 
-            else:
+            else:"""
 
-                if not self.game_over_state:
-                    current_time_sec = pygame.time.get_ticks() / 1000
-                    self.time_taken = current_time_sec - self.start_time
+            if self.playback_active and self.game_playback:
+                self.game_playback.update()  
+                # Assuming game_playback.update() processes events internally
+                # If it doesn't, add code to get pending events:
+                if hasattr(self.game_playback, 'get_pending_events'):
+                    playback_events = self.game_playback.get_pending_events()
+            
+            # Process events from network if online
+            if self.game_type == GameType.ONLINE and hasattr(self, 'network_client') and self.network_client:
+                # Get network events
+                try:
+                    network_events = self.get_network_events() 
+                except Exception as e:
+                    logger.error(f"Error getting network events: {e}")
+                    network_events = []
 
-                current_time = pygame.time.get_ticks()
-                if self.ai_enabled and not self.control_enemy:
-                    if self.turn_based_mode:
-                        if not self.current_player_turn and current_time - self.last_ai_move_time >= self.ai_move_cooldown:
-                            execute_ai_move(self, is_suggestion=False)
-                            self.last_ai_move_time = current_time
-                    else:
-                        if current_time - self.last_ai_move_time >= self.ai_move_cooldown:
-                            execute_ai_move(self, is_suggestion=False)
-                            self.last_ai_move_time = current_time
+            # Apply events from playback or network
+            try:
+                for event in playback_events + network_events:
+                    self.apply_event(event)
+            except Exception as e:
+                logger.error(f"Error applying events: {e}")
 
+            # Process events from playback if active
+            playback_events = []
+            if self.playback_active and self.game_playback:
+                self.game_playback.update()  
+                # Assuming game_playback.update() processes events internally
+                # If it doesn't, add code to get pending events:
+                playback_events = self.game_playback.get_pending_events()
+            
+            # Process events from network if online
+            network_events = []
+            if self.game_type == GameType.ONLINE:
+                # Get network events
+                network_events = self.get_network_events() 
 
-                if self.show_suggestions:
-                    if (self.turn_based_mode and self.current_player_turn) or (not self.control_enemy):
-                        if not self.suggestions or current_time - self.last_suggestion_time >= 5000:
+            # Apply events from playback or network
+            for event in playback_events + network_events:
+                self.apply_event(event)
+
+            if not self.game_over_state:
+                current_time_sec = pygame.time.get_ticks() / 1000
+                self.time_taken = current_time_sec - self.start_time
+
+            current_time = pygame.time.get_ticks()
+            if self.ai_enabled and not self.control_enemy:
+                if self.turn_based_mode:
+                    if not self.current_player_turn and current_time - self.last_ai_move_time >= self.ai_move_cooldown:
+                        execute_ai_move(self, is_suggestion=False)
+                        self.last_ai_move_time = current_time
+                else:
+                    if current_time - self.last_ai_move_time >= self.ai_move_cooldown:
+                        execute_ai_move(self, is_suggestion=False)
+                        self.last_ai_move_time = current_time
+
+            if self.show_suggestions:
+                if (self.turn_based_mode and self.current_player_turn) or (not self.control_enemy):
+                    if not self.suggestions or current_time - self.last_suggestion_time >= 5000:
+                        self.suggestions = suggest_moves(self, for_player=True)
+                        self.last_suggestion_time = current_time
+
+                    draw_suggestions(self, self.screen)
+
+            # Handle events - important to put this earlier in the loop
+            for event in pygame.event.get():
+                if event.type == pygame.QUIT:
+                    running = False
+
+                elif self.playback_active and self.game_playback:
+                    if event.type == pygame.KEYDOWN:
+                        if event.key == pygame.K_SPACE:
+                            if self.game_playback.is_playing:
+                                self.game_playback.pause()
+                            else:
+                                self.game_playback.resume()
+                        elif event.key == pygame.K_RIGHT:
+                            self.game_playback.set_speed(self.game_playback.playback_speed + 0.25)
+                        elif event.key == pygame.K_LEFT:
+                            self.game_playback.set_speed(self.game_playback.playback_speed - 0.25)
+                        elif event.key == pygame.K_ESCAPE:
+                            self.playback_active = False
+                            self.game_playback = None
+                            self.game_started = False
+                            continue
+
+                elif event.type == pygame.KEYDOWN and not self.playback_active:
+                    # Handle regular keypresses when not in playback mode
+                    if event.key == pygame.K_SPACE and (self.game_type == GameType.LOCAL_MULTI or self.game_type == GameType.ONLINE):
+                        self.control_enemy = not self.control_enemy
+                        if self.control_enemy:
+                            logger.info("Now controlling enemy (red) cells")
+                            for cell in self.cells:
+                                if cell.cell_type == CellType.ENEMY:
+                                    self.create_impact_effect(cell.x, cell.y, False)
+                        else:
+                            logger.info("Now controlling player (blue) cells")
+                            for cell in self.cells:
+                                if cell.cell_type == CellType.PLAYER:
+                                    self.create_impact_effect(cell.x, cell.y, True)
+                        
+                        # Record this action if recording
+                        if hasattr(self, 'game_recorder') and self.game_recorder and self.game_recorder.recording:
+                            self.game_recorder.record_event("CONTROL_SWITCH", {
+                                "control_enemy": self.control_enemy
+                            })
+                        
+                        # Notify network if in online mode
+                        if self.game_type == GameType.ONLINE and hasattr(self, 'send_network_event'):
+                            self.send_network_event("CONTROL_SWITCH", {
+                                "control_enemy": self.control_enemy
+                            })
+
+                    elif event.key == pygame.K_t:
+                        self.toggle_turn_based_mode()
+                        # Record this action if recording
+                        if hasattr(self, 'game_recorder') and self.game_recorder and self.game_recorder.recording:
+                            self.game_recorder.record_event("TURN_BASED_TOGGLE", {
+                                "turn_based": self.turn_based_mode
+                            })
+
+                    #commented that part, as ai is only available for single player, and makes no sense to other, and if it is single player it automatically playes against ai
+                    # elif event.key == pygame.K_a:
+                        # self.toggle_ai()
+
+                    #same for game difficulty - if I want to save it in game history, it must be chosen at the beginning
+                    #elif event.key == pygame.K_d:
+                        #self.cycle_ai_difficulty()
+
+                    #help is currently available only in single player mode, maybe later add it to others
+                    elif event.key == pygame.K_h and self.game_type==GameType.SINGLE_PLAYER and not self.playback_active:
+                        self.show_suggestions = not self.show_suggestions
+                        if self.show_suggestions:
+                            logger.info("Move suggestions enabled - generating suggestions")
                             self.suggestions = suggest_moves(self, for_player=True)
-                            self.last_suggestion_time = current_time
+                            print(f"Generated {len(self.suggestions)} suggestions")
+                            for s in self.suggestions:
+                                print(f"Suggestion: {s.get('description')} ({s.get('type')})")
+                        else:
+                            logger.info("Move suggestions disabled")
+                            self.suggestions = []
 
-                        draw_suggestions(self, self.screen)
+                    elif event.key == pygame.K_s:
+                        if not self.playback_active:
+                            self.save_game_progress()
+                            continue
 
-                for event in pygame.event.get():
-                    if event.type == pygame.QUIT:
-                        running = False
+                elif event.type == pygame.MOUSEBUTTONDOWN:
+                    if event.button == 1:  # Left click
+                        mouse_pos = pygame.mouse.get_pos()
+                        clicked_cell = self.get_cell_at_position(mouse_pos[0], mouse_pos[1])
 
-                    elif self.playback_active and self.game_playback:
-                        if event.type == pygame.KEYDOWN:
-                            if event.key == pygame.K_SPACE:
-                                if self.game_playback.is_playing:
-                                    self.game_playback.pause()
-                                else:
-                                    self.game_playback.resume()
-                            elif event.key == pygame.K_RIGHT:
-                                self.game_playback.set_speed(self.game_playback.playback_speed + 0.25)
-                            elif event.key == pygame.K_LEFT:
-                                self.game_playback.set_speed(self.game_playback.playback_speed - 0.25)
-                            elif event.key == pygame.K_ESCAPE:
-                                self.playback_active = False
-                                self.game_playback = None
-                                self.game_started = False
-                                continue
-
-                    elif event.type == pygame.KEYDOWN:
-                        if event.key == pygame.K_SPACE and (self.game_type == GameType.LOCAL_MULTI or self.game_type==GameType.ONLINE):
-                            self.control_enemy = not self.control_enemy
-                            if self.control_enemy:
-                                logger.info("Now controlling enemy (red) cells")
-                                for cell in self.cells:
-                                    if cell.cell_type == CellType.ENEMY:
-                                        self.create_impact_effect(cell.x, cell.y, False)
-                            else:
-                                logger.info("Now controlling player (blue) cells")
-                                for cell in self.cells:
-                                    if cell.cell_type == CellType.PLAYER:
-                                        self.create_impact_effect(cell.x, cell.y, True)
-
-                        elif event.key == pygame.K_t:
-                            self.toggle_turn_based_mode()
-
-                        #commented that part, as ai is only available for single player, and makes no sense to other, and if it is single player it automatically playes against ai
-                        # elif event.key == pygame.K_a:
-                            # self.toggle_ai()
-
-                        #same for game difficulty - if I want to save it in game history, it must be chosen at the beginning
-                        #elif event.key == pygame.K_d:
-                            #self.cycle_ai_difficulty()
-
-                        #help is currently available only in single player mode, maybe later add it to others
-                        elif event.key == pygame.K_h and self.game_type==GameType.SINGLE_PLAYER:
-                            self.show_suggestions = not self.show_suggestions
-                            if self.show_suggestions:
-                                logger.info("Move suggestions enabled - generating suggestions")
-                                self.suggestions = suggest_moves(self, for_player=True)
-                                print(f"Generated {len(self.suggestions)} suggestions")
-                                for s in self.suggestions:
-                                    print(f"Suggestion: {s.get('description')} ({s.get('type')})")
-                            else:
-                                logger.info("Move suggestions disabled")
-                                self.suggestions = []
-
-                        elif event.key == pygame.K_s:
-                            if not self.playback_active:
-                                self.save_game_progress()
-                                continue
-
-
-                    elif event.type == pygame.MOUSEBUTTONDOWN:
-                        if event.button == 1:  # Left click
-                            mouse_pos = pygame.mouse.get_pos()
-                            clicked_cell = self.get_cell_at_position(mouse_pos[0], mouse_pos[1])
-
-                            if clicked_cell:
-                                if not creating_bridge:
-                                    if (self.control_enemy and clicked_cell.cell_type == CellType.ENEMY) or \
-                                            (not self.control_enemy and clicked_cell.cell_type == CellType.PLAYER):
-                                        creating_bridge = True
-                                        bridge_start_cell = clicked_cell
-                                        self.create_impact_effect(clicked_cell.x, clicked_cell.y,
-                                                                  not self.control_enemy)
-                                else:
-                                    if clicked_cell != bridge_start_cell:
-                                        if self.create_bridge(bridge_start_cell, clicked_cell):
-                                            self.create_impact_effect(clicked_cell.x, clicked_cell.y,
-                                                                      not self.control_enemy)
-                                    creating_bridge = False
-                                    bridge_start_cell = None
-                            else:
-                                clicked_bridge, refund_to_source = self.get_bridge_at_position(mouse_pos[0], mouse_pos[1])
-
-                                if clicked_bridge:
-                                    refund_cell = clicked_bridge.source_cell if refund_to_source else clicked_bridge.target_cell
-                                    can_remove = False
-
-                                    if (self.control_enemy and refund_cell.cell_type == CellType.ENEMY) or \
-                                            (not self.control_enemy and refund_cell.cell_type == CellType.PLAYER):
-                                        can_remove = True
-
-                                    if can_remove:
-                                        bridge_cost = getattr(clicked_bridge, 'creation_cost',
-                                                              1)
-                                        self.remove_bridge(clicked_bridge)
-
-                                        refund_cell.points += bridge_cost
-
-                                        self.create_impact_effect(refund_cell.x, refund_cell.y,
-                                                                  refund_cell.cell_type == CellType.PLAYER)
-                                        logger.info(
-                                            f"Bridge removed. Refunded {bridge_cost} points to cell at ({refund_cell.x}, {refund_cell.y})")
-
-                                        continue
-
-                            if self.show_context_menu:
-                                if self.menu_rect.collidepoint(mouse_pos):
-                                    option_index = (mouse_pos[1] - self.menu_rect.y) // 30
-                                    if option_index == 0:
-                                        logger.info(f"All connections are removed")
-                                        self.remove_all_bridges_from_cell(self.context_menu_cell)
-
-                                self.show_context_menu = False
-                                self.context_menu_cell = None
-                                continue
-
-                        elif event.button == 3:  # Right click
-                            mouse_pos = pygame.mouse.get_pos()
-                            clicked_cell = self.get_cell_at_position(mouse_pos[0], mouse_pos[1])
-
-                            if clicked_cell:
+                        if clicked_cell:
+                            if not creating_bridge:
                                 if (self.control_enemy and clicked_cell.cell_type == CellType.ENEMY) or \
                                         (not self.control_enemy and clicked_cell.cell_type == CellType.PLAYER):
-                                    self.show_context_menu = True
-                                    self.context_menu_cell = clicked_cell
-                                    logger.info(f"Context menu opened for cell at ({clicked_cell.x}, {clicked_cell.y})")
-
-                if self.turn_based_mode and self.turn_timer_active:
-                    dt = self.clock.get_time() / 1000.0  # ms to s
-                    self.turn_time_remaining -= dt
-
-                    if self.turn_time_remaining <= 0 or self.move_made_this_turn:
-                        self.switch_turns()
-                    elif event.type == pygame.MOUSEBUTTONDOWN:
-                        if event.button == 1:  # Left click
-                            mouse_pos = pygame.mouse.get_pos()
-                            clicked_cell = self.get_cell_at_position(mouse_pos[0], mouse_pos[1])
-
-                            if clicked_cell:
-                                if not creating_bridge:
-                                    can_start_bridge = True
-
-                                    if self.turn_based_mode:
-                                        is_player_cell = clicked_cell.cell_type == CellType.PLAYER
-                                        is_enemy_cell = clicked_cell.cell_type == CellType.ENEMY
-
-                                        if (is_player_cell and not self.current_player_turn) or \
-                                                (is_enemy_cell and self.current_player_turn):
-                                            can_start_bridge = False
-                                            logger.info("Not your turn to create a bridge")
-
-                                    if can_start_bridge and (
-                                            (self.control_enemy and clicked_cell.cell_type == CellType.ENEMY) or \
-                                            (not self.control_enemy and clicked_cell.cell_type == CellType.PLAYER)):
-                                        creating_bridge = True
-                                        bridge_start_cell = clicked_cell
-                                        self.create_impact_effect(clicked_cell.x, clicked_cell.y,
-                                                                  not self.control_enemy)
-                                else:
-                                    if clicked_cell != bridge_start_cell:
-                                        if self.create_bridge(bridge_start_cell, clicked_cell):
-                                            self.create_impact_effect(clicked_cell.x, clicked_cell.y,
-                                                                      not self.control_enemy)
-
-                                            if self.turn_based_mode:
-                                                self.move_made_this_turn = True
-                                                self.switch_turns()
-
-                                    creating_bridge = False
-                                    bridge_start_cell = None
+                                    creating_bridge = True
+                                    bridge_start_cell = clicked_cell
+                                    self.create_impact_effect(clicked_cell.x, clicked_cell.y,
+                                                                not self.control_enemy)
                             else:
-                                clicked_bridge, refund_to_source = self.get_bridge_at_position(mouse_pos[0], mouse_pos[1])
-
-                                if clicked_bridge:
-                                    can_remove = True
-
-                                    if self.turn_based_mode:
-                                        refund_cell = clicked_bridge.source_cell if refund_to_source else clicked_bridge.target_cell
-                                        is_player_bridge = refund_cell.cell_type == CellType.PLAYER
-                                        is_enemy_bridge = refund_cell.cell_type == CellType.ENEMY
-
-                                        if (is_player_bridge and not self.current_player_turn) or \
-                                                (is_enemy_bridge and self.current_player_turn):
-                                            can_remove = False
-                                            logger.info("Not your turn to remove this bridge")
-
-                                    refund_cell = clicked_bridge.source_cell if refund_to_source else clicked_bridge.target_cell
-                                    user_controls_cell = (self.control_enemy and refund_cell.cell_type == CellType.ENEMY) or \
-                                                         (
-                                                                 not self.control_enemy and refund_cell.cell_type == CellType.PLAYER)
-
-                                    if can_remove and user_controls_cell:
-                                        bridge_cost = getattr(clicked_bridge, 'creation_cost',
-                                                              1)
-
-                                        self.remove_bridge(clicked_bridge)
-
-                                        refund_cell.points += bridge_cost
-
-                                        self.create_impact_effect(refund_cell.x, refund_cell.y,
-                                                                  refund_cell.cell_type == CellType.PLAYER)
-                                        logger.info(
-                                            f"Bridge removed. Refunded {bridge_cost} points to cell at ({refund_cell.x}, {refund_cell.y})")
-
+                                if clicked_cell != bridge_start_cell:
+                                    if self.create_bridge(bridge_start_cell, clicked_cell):
+                                        self.create_impact_effect(clicked_cell.x, clicked_cell.y,
+                                                                    not self.control_enemy)
+                                        
+                                        # Record this bridge creation
+                                        if hasattr(self, 'game_recorder') and self.game_recorder and self.game_recorder.recording:
+                                            self.game_recorder.record_event("BRIDGE_CREATED", {
+                                                "source_cell_id": id(bridge_start_cell),
+                                                "target_cell_id": id(clicked_cell)
+                                            })
+                                        
+                                        # Send to network if online
+                                        if self.game_type == GameType.ONLINE and hasattr(self, 'send_network_event'):
+                                            self.send_network_event("BRIDGE_CREATED", {
+                                                "source_cell_id": id(bridge_start_cell),
+                                                "target_cell_id": id(clicked_cell)
+                                            })
+                                        
                                         if self.turn_based_mode:
                                             self.move_made_this_turn = True
                                             self.switch_turns()
-
-                                        continue
-
-                for cell in self.cells:
-                    cell.update(current_time)
-                    if cell.cell_type != CellType.EMPTY:
-                        self.update_evolution_based_on_points(cell)
-
-                if self.ai_enabled:
-                    if self.ai_difficulty == "Easy":
-                        self.ai_move_cooldown = 1500
-                    elif self.ai_difficulty == "Medium":
-                        self.ai_move_cooldown = 1000
-                    else:  # Hard
-                        self.ai_move_cooldown = 500
-
-                    #self.ai.update(current_time)
-
-                    #if current_time % 20000 < 50:
-                     #   self.ai.adapt_strategy()
-
-                self.spawn_balls(current_time)
-
-                for bridge in self.bridges:
-                    bridge.update()
-
-                balls_to_remove = []
-                for ball in self.balls:
-                    ball.update()
-
-                    for other_ball in self.balls:
-                        if ball != other_ball and ball.check_collision(other_ball):
-                            if ball not in balls_to_remove:
-                                balls_to_remove.append(ball)
-                            if other_ball not in balls_to_remove:
-                                balls_to_remove.append(other_ball)
-
-                            self.create_collision_effect(ball.x, ball.y)
-
-                    target_cell = self.get_cell_at_position(ball.target_x, ball.target_y)
-                    if target_cell and ball.reached_target(target_cell):
-                        balls_to_remove.append(ball)
-
-                        self.create_impact_effect(target_cell.x, target_cell.y, ball.is_player)
-
-                        if target_cell.cell_type == CellType.EMPTY:
-                            captured = target_cell.try_capture(ball.attack_value, ball.is_player)
-                            if captured and ball.is_player:
-                                self.points += 50
-                        elif (target_cell.cell_type == CellType.PLAYER and ball.is_player) or \
-                                (target_cell.cell_type == CellType.ENEMY and not ball.is_player):
-                            target_cell.points += ball.attack_value
-                            if ball.is_player:
-                                self.points += 5
+                                
+                                creating_bridge = False
+                                bridge_start_cell = None
                         else:
-                            damage = ball.attack_value
+                            clicked_bridge, refund_to_source = self.get_bridge_at_position(mouse_pos[0], mouse_pos[1])
 
-                            if not getattr(ball, 'is_support_ball', False):
-                                support_multiplier = self.get_support_bonus(ball.source_cell)
-                                damage = int(damage * support_multiplier)
+                            if clicked_bridge:
+                                refund_cell = clicked_bridge.source_cell if refund_to_source else clicked_bridge.target_cell
+                                can_remove = False
 
-                            old_points = target_cell.points
-                            target_cell.points = max(0, target_cell.points - damage)
-                            points_reduced = old_points - target_cell.points
+                                if (self.control_enemy and refund_cell.cell_type == CellType.ENEMY) or \
+                                        (not self.control_enemy and refund_cell.cell_type == CellType.PLAYER):
+                                    can_remove = True
+
+                                if can_remove:
+                                    bridge_cost = getattr(clicked_bridge, 'creation_cost', 1)
+                                    
+                                    # Record before removing
+                                    if hasattr(self, 'game_recorder') and self.game_recorder and self.game_recorder.recording:
+                                        self.game_recorder.record_event("BRIDGE_REMOVED", {
+                                            "source_cell_id": id(clicked_bridge.source_cell),
+                                            "target_cell_id": id(clicked_bridge.target_cell)
+                                        })
+                                    
+                                    self.remove_bridge(clicked_bridge)
+                                    refund_cell.points += bridge_cost
+
+                                    self.create_impact_effect(refund_cell.x, refund_cell.y,
+                                                                refund_cell.cell_type == CellType.PLAYER)
+                                    logger.info(
+                                        f"Bridge removed. Refunded {bridge_cost} points to cell at ({refund_cell.x}, {refund_cell.y})")
+                                    
+                                    # Send to network if online
+                                    if self.game_type == GameType.ONLINE and hasattr(self, 'send_network_event'):
+                                        self.send_network_event("BRIDGE_REMOVED", {
+                                            "source_cell_id": id(clicked_bridge.source_cell),
+                                            "target_cell_id": id(clicked_bridge.target_cell)
+                                        })
+
+                                    continue
+
+                        if self.show_context_menu:
+                            if self.menu_rect.collidepoint(mouse_pos):
+                                option_index = (mouse_pos[1] - self.menu_rect.y) // 30
+                                if option_index == 0:
+                                    logger.info(f"All connections are removed")
+                                    self.remove_all_bridges_from_cell(self.context_menu_cell)
+
+                            self.show_context_menu = False
+                            self.context_menu_cell = None
+                            continue
+
+                    elif event.button == 3:  # Right click
+                        mouse_pos = pygame.mouse.get_pos()
+                        clicked_cell = self.get_cell_at_position(mouse_pos[0], mouse_pos[1])
+
+                        if clicked_cell:
+                            if (self.control_enemy and clicked_cell.cell_type == CellType.ENEMY) or \
+                                    (not self.control_enemy and clicked_cell.cell_type == CellType.PLAYER):
+                                self.show_context_menu = True
+                                self.context_menu_cell = clicked_cell
+                                logger.info(f"Context menu opened for cell at ({clicked_cell.x}, {clicked_cell.y})")
+
+            # Turn-based mode timer
+            if self.turn_based_mode and self.turn_timer_active:
+                dt = self.clock.get_time() / 1000.0  # ms to s
+                self.turn_time_remaining -= dt
+
+                if self.turn_time_remaining <= 0 or self.move_made_this_turn:
+                    self.switch_turns()
+                    
+                    # Record turn switch
+                    if hasattr(self, 'game_recorder') and self.game_recorder and self.game_recorder.recording:
+                        self.game_recorder.record_event("TURN_SWITCH", {
+                            "is_player_turn": self.current_player_turn
+                        })
+                    
+                    # Send to network if online
+                    if self.game_type == GameType.ONLINE and hasattr(self, 'send_network_event'):
+                        self.send_network_event("TURN_SWITCH", {
+                            "is_player_turn": self.current_player_turn
+                        })
+
+            # Update all cells
+            for cell in self.cells:
+                old_points = cell.points
+                old_evolution = cell.evolution.value if hasattr(cell.evolution, 'value') else 0
+                
+                cell.update(current_time)
+                if cell.cell_type != CellType.EMPTY:
+                    self.update_evolution_based_on_points(cell)
+                
+                # Record cell updates if significant changes occurred
+                if (hasattr(self, 'game_recorder') and self.game_recorder and self.game_recorder.recording and 
+                    (old_points != cell.points or 
+                    (hasattr(cell.evolution, 'value') and old_evolution != cell.evolution.value))):
+                    
+                    self.game_recorder.record_event("CELL_UPDATED", {
+                        "cell_id": id(cell),
+                        "points": cell.points,
+                        "evolution": cell.evolution.value if hasattr(cell.evolution, 'value') else 0
+                    })
+
+            # AI difficulty settings
+            if self.ai_enabled:
+                if self.ai_difficulty == "Easy":
+                    self.ai_move_cooldown = 1500
+                elif self.ai_difficulty == "Medium":
+                    self.ai_move_cooldown = 1000
+                else:  # Hard
+                    self.ai_move_cooldown = 500
+
+                #self.ai.update(current_time)
+
+                #if current_time % 20000 < 50:
+                    #   self.ai.adapt_strategy()
+
+            # Spawn new balls
+            self.spawn_balls(current_time)
+
+            # Update bridges
+            for bridge in self.bridges:
+                bridge.update()
+
+            # Process balls movement and collisions
+            balls_to_remove = []
+            for ball in self.balls:
+                ball.update()
+
+                for other_ball in self.balls:
+                    if ball != other_ball and ball.check_collision(other_ball):
+                        if ball not in balls_to_remove:
+                            balls_to_remove.append(ball)
+                        if other_ball not in balls_to_remove:
+                            balls_to_remove.append(other_ball)
+
+                        self.create_collision_effect(ball.x, ball.y)
+                        
+                        # Record collision
+                        if hasattr(self, 'game_recorder') and self.game_recorder and self.game_recorder.recording:
+                            self.game_recorder.record_event("BALL_COLLISION", {
+                                "x": ball.x,
+                                "y": ball.y
+                            })
+
+                target_cell = self.get_cell_at_position(ball.target_x, ball.target_y)
+                if target_cell and ball.reached_target(target_cell):
+                    balls_to_remove.append(ball)
+                    old_points = target_cell.points
+                    old_type = target_cell.cell_type
+                    
+                    self.create_impact_effect(target_cell.x, target_cell.y, ball.is_player)
+
+                    if target_cell.cell_type == CellType.EMPTY:
+                        captured = target_cell.try_capture(ball.attack_value, ball.is_player)
+                        if captured and ball.is_player:
+                            self.points += 50
+                            
+                            # Record empty cell capture
+                            if hasattr(self, 'game_recorder') and self.game_recorder and self.game_recorder.recording:
+                                self.game_recorder.record_event("CELL_CAPTURED", {
+                                    "cell_id": id(target_cell),
+                                    "new_type": target_cell.cell_type.name,
+                                    "points": target_cell.points
+                                })
+                                
+                    elif (target_cell.cell_type == CellType.PLAYER and ball.is_player) or \
+                            (target_cell.cell_type == CellType.ENEMY and not ball.is_player):
+                        target_cell.points += ball.attack_value
+                        if ball.is_player:
+                            self.points += 5
+                        
+                        # Record reinforcement
+                        if hasattr(self, 'game_recorder') and self.game_recorder and self.game_recorder.recording:
+                            self.game_recorder.record_event("CELL_REINFORCED", {
+                                "cell_id": id(target_cell),
+                                "points_added": ball.attack_value,
+                                "total_points": target_cell.points
+                            })
+                    else:
+                        damage = ball.attack_value
+
+                        if not getattr(ball, 'is_support_ball', False):
+                            support_multiplier = self.get_support_bonus(ball.source_cell)
+                            damage = int(damage * support_multiplier)
+
+                        old_points = target_cell.points
+                        target_cell.points = max(0, target_cell.points - damage)
+                        points_reduced = old_points - target_cell.points
+
+                        if ball.is_player:
+                            self.points += points_reduced * 10
+
+                        if damage > ball.attack_value and ball.is_player:
+                            self.create_support_effect(target_cell.x, target_cell.y, ball.is_player)
+
+                        # Record attack
+                        if hasattr(self, 'game_recorder') and self.game_recorder and self.game_recorder.recording:
+                            self.game_recorder.record_event("CELL_ATTACKED", {
+                                "cell_id": id(target_cell),
+                                "damage": damage,
+                                "remaining_points": target_cell.points
+                            })
+
+                        if target_cell.points == 0:
+                            self.remove_all_bridges_from_cell(target_cell)
+                            old_type = target_cell.cell_type
+                            target_cell.cell_type = CellType.PLAYER if ball.is_player else CellType.ENEMY
+                            target_cell.points = 10
 
                             if ball.is_player:
-                                self.points += points_reduced * 10
+                                self.points += 100
 
-                            if damage > ball.attack_value and ball.is_player:
-                                self.create_support_effect(target_cell.x, target_cell.y, ball.is_player)
+                            logger.info(
+                                f"Cell at ({target_cell.x}, {target_cell.y}) captured: {old_type} -> {target_cell.cell_type}")
 
-                            if target_cell.points == 0:
-                                self.remove_all_bridges_from_cell(target_cell)
-                                old_type = target_cell.cell_type
-                                target_cell.cell_type = CellType.PLAYER if ball.is_player else CellType.ENEMY
-                                target_cell.points = 10
+                            # Record capture
+                            if hasattr(self, 'game_recorder') and self.game_recorder and self.game_recorder.recording:
+                                self.game_recorder.record_event("CELL_CAPTURED", {
+                                    "cell_id": id(target_cell),
+                                    "previous_type": old_type.name,
+                                    "new_type": target_cell.cell_type.name
+                                })
 
-                                if ball.is_player:
-                                    self.points += 100
+                            for _ in range(5):
+                                self.create_impact_effect(target_cell.x, target_cell.y, ball.is_player)
+            
+            # Remove processed balls
+            for ball in balls_to_remove:
+                if ball in self.balls:
+                    self.balls.remove(ball)
 
-                                logger.info(
-                                    f"Cell at ({target_cell.x}, {target_cell.y}) captured: {old_type} -> {target_cell.cell_type}")
+            # Draw everything
+            self.screen.blit(background, (0, 0))
 
-                                for _ in range(5):
-                                    self.create_impact_effect(target_cell.x, target_cell.y, ball.is_player)
-                for ball in balls_to_remove:
-                    if ball in self.balls:
-                        self.balls.remove(ball)
+            for bridge in self.bridges:
+                bridge.draw(self.screen)
 
-                self.screen.blit(background, (0, 0))
+            if creating_bridge:
+                mouse_pos = pygame.mouse.get_pos()
+                pygame.draw.line(self.screen, (100, 100, 100),
+                                    (bridge_start_cell.x, bridge_start_cell.y),
+                                    mouse_pos, BRIDGE_WIDTH)
 
-                for bridge in self.bridges:
-                    bridge.draw(self.screen)
+            for cell in self.cells:
+                cell.draw(self.screen, self)
 
-                if creating_bridge:
-                    mouse_pos = pygame.mouse.get_pos()
-                    pygame.draw.line(self.screen, (100, 100, 100),
-                                     (bridge_start_cell.x, bridge_start_cell.y),
-                                     mouse_pos, BRIDGE_WIDTH)
+            for ball in self.balls:
+                ball.draw(self.screen)
 
-                for cell in self.cells:
-                    cell.draw(self.screen, self)
+            self.draw_game_info()
 
-                for ball in self.balls:
-                    ball.draw(self.screen)
+            if self.show_suggestions:
+                draw_suggestions(self, self.screen)
 
-                self.draw_game_info()
-
-                if self.show_suggestions:
-                    draw_suggestions(self, self.screen)
-
-                self.draw_context_menu(self.screen)
-                if self.check_win_condition():
-                    continue
+            self.draw_context_menu(self.screen)
+            
+            # Check win condition
+            if self.check_win_condition():
+                continue
+                
             pygame.display.flip()
-            self.clock.tick(FPS)
+
+        if hasattr(self, 'network_client') and self.network_client:
+            self.network_client.disconnect()
+        
         pygame.quit()
         sys.exit()
 
@@ -1498,6 +1663,12 @@ class Game:
                 "targetId": self.game_recorder.cell_id_map.get(target_cell, -1),
                 "direction": "TWO_WAY" if existing_bridge else "ONE_WAY",
                 "cost": bridge_cost
+            })
+
+        if self.game_type == GameType.ONLINE:
+            self.send_network_event("BRIDGE_CREATED", {
+                "source_cell_id": id(source_cell),
+                "target_cell_id": id(target_cell)
             })
 
         return True
@@ -2418,6 +2589,83 @@ class Game:
         self.game_started = False
         logger.info("Game saved successfully. Returning to menu.")
 
+    def apply_event(self, event):
+        """Apply an event from playback or network to the game state"""
+        event_type = event.get("eventType")
+        data = event.get("data")
+        
+        if event_type == "BRIDGE_CREATED":
+            source_id = data.get("source_cell_id")
+            target_id = data.get("target_cell_id")
+            
+            source_cell = self.cell_id_map_reverse.get(source_id)
+            target_cell = self.cell_id_map_reverse.get(target_id)
+            
+            if source_cell and target_cell:
+                self.create_bridge(source_cell, target_cell)
+        
+        elif event_type == "BRIDGE_REMOVED":
+            source_id = data.get("source_cell_id")
+            target_id = data.get("target_cell_id")
+            
+            source_cell = self.cell_id_map_reverse.get(source_id)
+            target_cell = self.cell_id_map_reverse.get(target_id)
+            
+            if source_cell and target_cell:
+                for bridge in self.bridges:
+                    if bridge.source_cell == source_cell and bridge.target_cell == target_cell:
+                        self.remove_bridge(bridge)
+                        break
+        
+        elif event_type == "CELL_CAPTURED":
+            cell_id = data.get("cell_id")
+            new_type = data.get("new_type")
+            points = data.get("points", 10)
+            
+            cell = self.cell_id_map_reverse.get(cell_id)
+            if cell and new_type:
+                cell.cell_type = getattr(CellType, new_type)
+                cell.points = points
+        
+        elif event_type == "CELL_EVOLVED":
+            cell_id = data.get("cell_id")
+            new_level = data.get("new_level")
+            
+            cell = self.cell_id_map_reverse.get(cell_id)
+            if cell and new_level:
+                cell.evolution = EvolutionLevel(new_level)
+        
+        elif event_type == "CONTROL_SWITCH":
+            self.control_enemy = data.get("control_enemy", False)
+        
+        elif event_type == "TURN_SWITCH":
+            self.current_player_turn = data.get("is_player_turn", True)
+            self.turn_time_remaining = self.turn_time_max
+        
+        # Add any other event types your game uses
+
+    def init_network(self):
+        if self.game_type == GameType.ONLINE:
+            self.network_client = GameNetworkClient(self)
+            success = self.network_client.connect(
+                self.network_config["ip"],
+                self.network_config["port"]
+            )
+            if not success:
+                logger.error("Failed to connect to game server")
+                return False
+            return True
+        return False
+
+    def get_network_events(self):
+        if hasattr(self, 'network_client') and self.network_client and self.game_type == GameType.ONLINE:
+            return self.network_client.get_pending_events()
+        return []
+
+    def send_network_event(self, event_type, data):
+        if hasattr(self, 'network_client') and self.network_client and self.game_type == GameType.ONLINE:
+            return self.network_client.send_event(event_type, data)
+        return False
 
     def _serialize_cell(self, cell):
         return {
@@ -2454,8 +2702,164 @@ class Game:
             "is_support_ball": getattr(ball, 'is_support_ball', False),
             "attack_value": ball.attack_value
         }
+    
+    def deserialize_cell(self, cell_data):
+        cell_type = getattr(self.CellType, cell_data.get("type", "EMPTY"))
+        shape = getattr(self.CellShape, cell_data.get("shape", "CIRCLE"))
+        evolution = self.EvolutionLevel(cell_data.get("evolution", 1))
+        
+        cell = self.Cell(
+            cell_data.get("x", 0),
+            cell_data.get("y", 0),
+            cell_type,
+            shape,
+            evolution
+        )
+        cell.points = cell_data.get("points", 0)
+        return cell
+
+    def deserialize_bridge(self, bridge_data):
+        source_id = bridge_data.get("source_cell_id")  # match your serializer field name
+        target_id = bridge_data.get("target_cell_id") 
+        
+        if source_id in self.cell_id_map and target_id in self.cell_id_map:
+            source_cell = self.cell_id_map[source_id]
+            target_cell = self.cell_id_map[target_id]
+            
+            bridge = Bridge(source_cell, target_cell)  # Assuming you have a Bridge class
+            bridge.creation_cost = bridge_data.get("creation_cost", 1)
+            return bridge
+        return None
+
+    def deserialize_ball(self, ball_data):
+        source_id = ball_data.get("sourceId")
+        target_id = ball_data.get("targetId")
+        
+        source_cell = self.cell_id_map.get(source_id)
+        target_cell = self.cell_id_map.get(target_id) if target_id != -1 else None
+        
+        ball = Ball(
+            ball_data.get("x", 0),
+            ball_data.get("y", 0),
+            ball_data.get("target_x", 0),
+            ball_data.get("target_y", 0),
+            ball_data.get("attack_value", 1),
+            ball_data.get("is_player", True)
+        )
+        ball.source_cell = source_cell
+        ball.target_cell = target_cell
+        ball.is_support_ball = ball_data.get("is_support_ball", False)
+        return ball
 
 
+class GameNetworkClient:
+    def __init__(self, game):
+        self.game = game
+        self.socket = None
+        self.connected = False
+        self.receiver_thread = None
+        self.pending_events = []
+    
+    def connect(self, host='localhost', port=5555):
+        """Connect to the game server"""
+        try:
+            logger.info(f"Creating socket connection to {host}:{port}")
+            self.socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            self.socket.settimeout(5)  # 5 second timeout
+            self.socket.connect((host, port))
+            self.socket.settimeout(None)  # Reset to blocking mode
+            self.connected = True
+            logger.info(f"Connected to server at {host}:{port}")
+            
+            # Start receiver thread
+            self.receiver_thread = threading.Thread(target=self.receive_messages, daemon=True)
+            self.receiver_thread.start()
+            
+            # Send initial role message
+            role = "ENEMY" if self.game.control_enemy else "PLAYER"
+            initial_msg = json.dumps({"type": "CONNECT", "role": role})
+            encrypted_msg = self.encrypt_message(initial_msg)
+            self.socket.send(encrypted_msg.encode('utf-8'))
+            
+            return True
+        except socket.error as e:
+            logger.error(f"Socket error: {e}")
+            return False
+        except Exception as e:
+            logger.error(f"Connection error: {e}")
+            return False
+    
+    def encrypt_message(self, message, key='X'):
+        """Encrypt a message using XOR with the given key"""
+        return ''.join(chr(ord(c) ^ ord(key)) for c in message)
+    
+    def decrypt_message(self, message, key='X'):
+        """Decrypt a message using XOR with the given key"""
+        return ''.join(chr(ord(c) ^ ord(key)) for c in message)
+    
+    def receive_messages(self):
+        """Background thread to receive messages from the server"""
+        while self.connected:
+            try:
+                encrypted_message = self.socket.recv(4096).decode('utf-8')
+                if not encrypted_message:
+                    logger.info("Server closed connection")
+                    self.connected = False
+                    break
+                
+                message = self.decrypt_message(encrypted_message)
+                
+                try:
+                    event = json.loads(message)
+                    self.pending_events.append(event)
+                    logger.info(f"Received event: {event['type']}")
+                except json.JSONDecodeError:
+                    logger.error(f"Invalid JSON: {message}")
+            except socket.timeout:
+                continue
+            except Exception as e:
+                logger.error(f"Error receiving message: {e}")
+                self.connected = False
+                break
+        
+        logger.info("Receiver thread ended")
+    
+    def get_pending_events(self):
+        """Get and clear pending events"""
+        events = self.pending_events.copy()
+        self.pending_events = []
+        return events
+    
+    def send_event(self, event_type, data):
+        """Send an event to the server"""
+        if not self.connected:
+            return False
+        
+        try:
+            event = {
+                "type": event_type,
+                "data": data,
+                "timestamp": time.time()
+            }
+            
+            json_data = json.dumps(event)
+            encrypted_data = self.encrypt_message(json_data)
+            self.socket.send(encrypted_data.encode('utf-8'))
+            return True
+        except Exception as e:
+            logger.error(f"Error sending event: {e}")
+            self.connected = False
+            return False
+    
+    def disconnect(self):
+        """Disconnect from the server"""
+        self.connected = False
+        if self.socket:
+            try:
+                self.socket.close()
+            except:
+                pass
+            
 def check_saved_games_for_level(level_name):
     saved_games = []
 
@@ -2657,7 +3061,7 @@ def create_menu(game):
                     mouse_pos = pygame.mouse.get_pos()
 
                     if editor_rect.collidepoint(mouse_pos):
-                        editor = LevelEditor(game)
+                        editor = LevelEditor() #(game)
                         editor.run()
                         pygame.event.clear()
                         game.game_data = load_game_data("game_data.json")
@@ -3157,10 +3561,6 @@ def safe_mongodb_operation(func):
             return None if not kwargs.get('default') else kwargs.get('default')
     return wrapper
 
-
-def send_action():
-
-    pass
 
 if __name__ == "__main__":
     game = Game()
